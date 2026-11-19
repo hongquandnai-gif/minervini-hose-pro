@@ -2,6 +2,7 @@ import time
 import json
 import threading
 import requests
+from requests.adapters import HTTPAdapter
 import datetime
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +17,24 @@ def get_vn_now() -> datetime.datetime:
 
 def get_vn_today() -> datetime.date:
     return get_vn_now().date()
+
+
+def is_vn_market_hours() -> bool:
+    now = get_vn_now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return datetime.time(8, 45) <= t <= datetime.time(15, 15)
+
+
+# Tái sử dụng kết nối TCP/TLS giúp tải toàn sàn nhanh hơn 3-5 lần
+HTTP_SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=1)
+HTTP_SESSION.mount("https://", _adapter)
+HTTP_SESSION.mount("http://", _adapter)
+HTTP_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+})
 
 
 HOSE_FULL_FALLBACK = [
@@ -77,16 +96,13 @@ BASKETS = {
 
 
 def get_market_symbols(market_type="HOSE"):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    }
     try:
         if market_type == "HOSE":
             url = "https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:HOSE&size=3000"
         else:
             url = "https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:HOSE,HNX,UPCOM&size=3000"
 
-        resp = requests.get(url, headers=headers, timeout=8)
+        resp = HTTP_SESSION.get(url, timeout=8)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             symbols = [
@@ -103,20 +119,15 @@ def get_market_symbols(market_type="HOSE"):
 
 
 def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
-    """Tải lịch sử OHLCV chuẩn hóa theo múi giờ Việt Nam (UTC+7 = +25200 giây) và đơn vị Nghìn đồng"""
+    """Tải lịch sử OHLCV chuẩn hóa múi giờ Việt Nam (UTC+7) và đơn vị Nghìn đồng"""
     sym = symbol.upper()
     buffer_start = start_date - datetime.timedelta(days=330)
     from_ts = int(datetime.datetime.combine(buffer_start, datetime.time.min, tzinfo=VN_TZ).timestamp())
     to_ts = int(datetime.datetime.combine(end_date, datetime.time.max, tzinfo=VN_TZ).timestamp())
 
     vnd_url = f"https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol={sym}&from={from_ts}&to={to_ts}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://dchart.vndirect.com.vn/",
-    }
-
     try:
-        resp = requests.get(vnd_url, headers=headers, timeout=6)
+        resp = HTTP_SESSION.get(vnd_url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("s") == "ok" and data.get("t"):
@@ -138,11 +149,7 @@ def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: d
     ssi_sym = "VN-INDEX" if sym == "VNINDEX" else sym
     ssi_url = f"https://iboard-api.ssi.com.vn/statistics/charts/history?resolution=1D&symbol={ssi_sym}&from={from_ts}&to={to_ts}"
     try:
-        resp = requests.get(
-            ssi_url,
-            headers={"User-Agent": headers["User-Agent"], "Referer": "https://iboard.ssi.com.vn/"},
-            timeout=6
-        )
+        resp = HTTP_SESSION.get(ssi_url, headers={"Referer": "https://iboard.ssi.com.vn/"}, timeout=6)
         if resp.status_code == 200:
             data = resp.json().get("data", resp.json())
             if data.get("s") == "ok" and data.get("t"):
@@ -167,7 +174,7 @@ def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: d
     return pd.DataFrame()
 
 
-def fetch_ssi_basket_history(symbols: list, start_date: datetime.date, end_date: datetime.date, max_workers: int = 20,
+def fetch_ssi_basket_history(symbols: list, start_date: datetime.date, end_date: datetime.date, max_workers: int = 24,
                              progress_callback=None) -> pd.DataFrame:
     results = []
     total = len(symbols)
@@ -194,7 +201,7 @@ def fetch_ssi_basket_history(symbols: list, start_date: datetime.date, end_date:
 
 class SSIRealtimeFeed:
     """
-    Hybrid Realtime Engine chuẩn hóa múi giờ UTC+7 cho Cloud Deployment.
+    Hybrid Realtime Engine chuẩn hóa UTC+7, chống Zombie Thread và hỗ trợ cả 3 sàn.
     """
     _instance = None
     _lock = threading.Lock()
@@ -261,19 +268,21 @@ class SSIRealtimeFeed:
 
     def _poll_ssi_iboard_snapshot(self) -> int:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://iboard.ssi.com.vn",
             "Referer": "https://iboard.ssi.com.vn/"
         }
-        urls = [
-            "https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN",
-            "https://iboard-query.ssi.com.vn/stock/group/VNALL"
-        ]
+        urls = ["https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN"]
+        if len(self.active_symbols) > 450:
+            urls.extend([
+                "https://iboard-query.ssi.com.vn/stock/exchange/hnx?boardId=MAIN",
+                "https://iboard-query.ssi.com.vn/stock/exchange/upcom?boardId=MAIN"
+            ])
+
         count = 0
         for url in urls:
             try:
-                resp = requests.get(url, headers=headers, timeout=4)
+                resp = HTTP_SESSION.get(url, headers=headers, timeout=4)
                 if resp.status_code == 200:
                     items = resp.json().get("data", [])
                     if isinstance(items, list) and len(items) > 0:
@@ -308,8 +317,6 @@ class SSIRealtimeFeed:
                                 is_vnd_unit=True
                             )
                             count += 1
-                        if count > 20:
-                            break
             except Exception:
                 continue
         return count
@@ -318,12 +325,8 @@ class SSIRealtimeFeed:
         to_ts = int(time.time())
         from_ts = to_ts - (7 * 86400)
         url = f"https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol={sym}&from={from_ts}&to={to_ts}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://dchart.vndirect.com.vn/"
-        }
         try:
-            r = requests.get(url, headers=headers, timeout=4)
+            r = HTTP_SESSION.get(url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=4)
             if r.status_code == 200:
                 d = r.json()
                 if d.get("s") == "ok" and d.get("t"):
@@ -367,11 +370,13 @@ class SSIRealtimeFeed:
                     if vnd_cnt > 0:
                         self.source_name = "Intraday Realtime (SSI/VND Hybrid)"
                         self.last_sync_str = get_vn_now().strftime("%H:%M:%S")
-                    time.sleep(4)
+                    time.sleep(5)
             except Exception:
                 time.sleep(3)
 
     def on_message(self, ws, message):
+        if not is_vn_market_hours():
+            return
         try:
             if isinstance(message, bytes):
                 message = message.decode("utf-8", errors="ignore")
@@ -423,20 +428,24 @@ class SSIRealtimeFeed:
     def start(self, symbols=None):
         if symbols:
             self.set_symbols(symbols)
-        if not self.is_running:
-            self.is_running = True
-            self.poll_thread = threading.Thread(target=self._run_polling_worker, daemon=True)
-            self.poll_thread.start()
-            self.ws_thread = threading.Thread(target=self._run_socket, daemon=True)
-            self.ws_thread.start()
+        with self._lock:
+            if not self.is_running:
+                self.is_running = True
+                if self.poll_thread is None or not self.poll_thread.is_alive():
+                    self.poll_thread = threading.Thread(target=self._run_polling_worker, daemon=True)
+                    self.poll_thread.start()
+                if self.ws_thread is None or not self.ws_thread.is_alive():
+                    self.ws_thread = threading.Thread(target=self._run_socket, daemon=True)
+                    self.ws_thread.start()
 
     def stop(self):
-        self.is_running = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
+        with self._lock:
+            self.is_running = False
+            if self.ws:
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
 
     def get_all_realtime(self):
         with self.data_lock:
