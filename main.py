@@ -10,7 +10,8 @@ from plotly.subplots import make_subplots
 
 from ssi_engine import (
     BASKETS,
-    get_market_symbols,
+    get_ssi_basket,
+    get_ssi_master_names,
     fetch_ssi_basket_history,
     fetch_ssi_symbol_history,
     get_vn_today,
@@ -24,7 +25,7 @@ if __name__ == '__main__' and not exists():
     sys.exit(stcli.main())
 
 st.set_page_config(
-    page_title="Hệ thống Giao dịch Minervini Pro - Toàn Sàn",
+    page_title="Hệ thống Giao dịch Minervini Pro - SSI Direct",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -143,7 +144,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- 2. HÀM TÍNH CHỈ BÁO & CACHE NỀN (CHỈ TÍNH 1 LẦN, TĂNG TỐC X10) ---
+# --- 2. HÀM TÍNH CHỈ BÁO & CACHE NỀN ---
 def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     grouped = df.groupby('Ticker', sort=False)
     for ma in [20, 50, 150, 200]:
@@ -203,8 +204,13 @@ def _aggregate_daily_breadth(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_market_symbols(market_type: str):
-    return get_market_symbols(market_type)
+def cached_ssi_basket(basket_label: str):
+    return get_ssi_basket(basket_label)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_ssi_master_names():
+    return get_ssi_master_names()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -226,12 +232,11 @@ def cached_market_base(symbols_tuple: tuple, start_d: datetime.date, end_d: date
     return df_raw, df_vnindex, daily_base, df_hist_base
 
 
-# --- 3. CẬP NHẬT REALTIME TỐC ĐỘ CAO (CHỈ TÍNH LÁT CẮT 265 PHIÊN CUỐI) ---
+# --- 3. CẬP NHẬT REALTIME TỐC ĐỘ CAO (LÁT CẮT 265 PHIÊN CUỐI) ---
 def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=None):
     if not rt_ticks:
         return daily_base, df_hist_base
 
-    # Chỉ cắt 265 phiên gần nhất của mỗi mã (đủ tính MA200, shift(252), 52W, VCP và đồ thị 160 phiên)
     df_tail = df_raw.groupby('Ticker', sort=False).tail(265).copy().reset_index(drop=True)
     max_market_date = df_tail['Date'].max()
     vn_today_ts = pd.Timestamp(get_vn_today())
@@ -305,7 +310,6 @@ def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=
 
     df_tail = _compute_indicators(df_tail)
 
-    # Chỉ cập nhật lại độ rộng cho ngày cuối cùng trở đi, giữ nguyên toàn bộ lịch sử daily_base
     last_base_date = daily_base['Date'].max()
     recent_slice = df_tail[df_tail['Date'] >= last_base_date]
     daily_recent = _aggregate_daily_breadth(recent_slice)
@@ -517,9 +521,8 @@ def highlight_rs(val):
 
 
 # --- 5. DASHBOARD REALTIME AUTO-REFRESH FRAGMENT ---
-def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
+def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, symbol_names, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
     vn_today = get_vn_today()
-    # Chỉ trộn tick realtime khi đang bật Live và ngày kết thúc bao gồm hôm nay
     rt_ticks = feed.get_all_realtime() if (feed.is_running and fetch_end >= vn_today) else {}
     daily_all, df_history = apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks)
 
@@ -569,9 +572,10 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     status_line = ""
     if feed.is_running:
         paused_tag = " (ĐÃ TẠM DỪNG MÀN HÌNH)" if st.session_state.get("pause_live_view", False) else ""
+        ws_count = len(feed.get_ws_discovered_symbols())
         status_line += (
             f"<div class='live-indicator'><div class='pulse-dot'></div> "
-            f"LIVE TRONG PHIÊN{paused_tag}: {len(rt_ticks)} mã nhận tick • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
+            f"LIVE TRONG PHIÊN{paused_tag}: {len(rt_ticks)} mã tick (WSS: {ws_count} mã) • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
         )
 
     if latest_pct >= 50:
@@ -718,6 +722,7 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
                     vcp_list.append({
                         'Live': "⚡ LIVE" if tk_name in rt_ticks else "EOD",
                         'Mã CP': tk_name,
+                        'Tên DN (SSI)': symbol_names.get(tk_name, ""),
                         'RS Rating': int(row['RS_Rating']),
                         'Giá Hiện Tại': row['Close'],
                         'Điểm Pivot (Mua)': res_vcp['buy_point'],
@@ -746,7 +751,9 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
                 disp_df = minervini_stocks[
                     ['Ticker', 'Close', 'RS_Rating', 'Pct_From_Peak', 'Pct_From_Bottom', 'Vol_MA20', 'MA20', 'MA50',
                      'MA150', 'MA200']
-                ].rename(columns={
+                ].copy()
+                disp_df.insert(1, 'Tên DN (SSI)', disp_df['Ticker'].map(lambda t: symbol_names.get(t, "")))
+                disp_df = disp_df.rename(columns={
                     'Ticker': 'Mã CP', 'Close': 'Giá Hiện Tại', 'Pct_From_Peak': '% Từ Đỉnh 52T',
                     'Pct_From_Bottom': '% Hồi Từ Đáy 52T', 'RS_Rating': 'RS Rating', 'Vol_MA20': 'KLGD TB 20P'
                 })
@@ -798,7 +805,7 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     with tabs[2]:
         st.markdown("### 🔍 Chẩn Đoán Cổ Phiếu Đơn & Đồ Thị Kỹ Thuật")
 
-        all_tickers = sorted(latest_data['Ticker'].unique().tolist())
+        all_tickers = [t for t in symbols if t in set(latest_data['Ticker'].unique())]
         minervini_set = set(base_stocks['Ticker'].tolist()) if not base_stocks.empty else set()
         rs_map = dict(zip(latest_data['Ticker'], latest_data['RS_Rating']))
 
@@ -810,11 +817,13 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
 
         def format_ticker_label(t):
             rs_val = rs_map.get(t, 0)
+            cname = symbol_names.get(t, "")
+            name_part = f" — {cname}" if cname else ""
             if t in vcp_tickers_set:
-                return f"📐 {t} — [Mô hình VCP | RS: {rs_val}]"
+                return f"📐 {t}{name_part} [VCP | RS: {rs_val}]"
             elif t in minervini_set:
-                return f"🔥 {t} — [Chuẩn Minervini | RS: {rs_val}]"
-            return f"{t} (RS: {rs_val})"
+                return f"🔥 {t}{name_part} [Minervini | RS: {rs_val}]"
+            return f"{t}{name_part} (RS: {rs_val})"
 
         if 'selected_diag_ticker' not in st.session_state or st.session_state['selected_diag_ticker'] not in ordered_tickers:
             st.session_state['selected_diag_ticker'] = ordered_tickers[0] if ordered_tickers else None
@@ -840,6 +849,10 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
             if not tk_data.empty:
                 tk = tk_data.iloc[0]
                 phase_title, phase_color, phase_desc = evaluate_stock_phase(tk)
+                comp_name = symbol_names.get(selected_ticker, "")
+
+                if comp_name:
+                    st.markdown(f"#### 🏢 {selected_ticker} — {comp_name}")
 
                 stock_history = df_history[df_history['Ticker'] == selected_ticker]
                 vcp_diag = detect_vcp_pattern(stock_history, actual_eval_date, lookback_days=150)
@@ -946,8 +959,8 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
 
 
 @st.fragment(run_every="10s")
-def render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
-    render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+def render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, symbol_names, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
+    render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, symbol_names, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
 
 
 # --- 6. GIAO DIỆN CHÍNH ---
@@ -955,8 +968,8 @@ def main():
     st.markdown("""
     <div class="main-header">
         <div>
-            <h1>⚡ Hệ thống Định lượng & Phân tích Chu kỳ Minervini (HOSE Direct)</h1>
-            <p>Biểu đồ HOSE (VN-INDEX) & Độ rộng Thị trường • Chu kỳ 4 Giai đoạn • Quét Siêu Cổ Phiếu VCP Realtime</p>
+            <h1>⚡ Hệ thống Định lượng & Phân tích Chu kỳ Minervini (SSI Direct)</h1>
+            <p>Danh sách & Tên gốc trực tiếp từ SSI iBoard / WebSocket • Chu kỳ 4 Giai đoạn • Quét Siêu Cổ Phiếu VCP</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -965,22 +978,23 @@ def main():
     default_start_date = today - datetime.timedelta(days=550)
 
     with st.sidebar:
-        st.markdown("### 📡 Nguồn Dữ Liệu")
-        basket_choice = st.selectbox("Chọn rổ danh mục theo dõi:", list(BASKETS.keys()), index=0)
+        st.markdown("### 📡 Danh Mục Gốc SSI")
+        basket_choice = st.selectbox("Chọn bảng / rổ gốc SSI:", list(BASKETS.keys()), index=0)
         custom_tickers = st.text_input("Hoặc gõ danh sách mã riêng:", placeholder="VD: FPT, SSI, HPG, VCB")
 
         if custom_tickers.strip():
-            symbols = [s.strip().upper() for s in custom_tickers.split(",") if len(s.strip()) == 3]
+            symbols = list(dict.fromkeys(
+                s.strip().upper() for s in custom_tickers.split(",") if len(s.strip()) == 3 and s.strip().isalpha()
+            ))
+            master_names = cached_ssi_master_names()
+            symbol_names = {s: master_names.get(s, "") for s in symbols}
+            source_info = "Danh sách tự nhập (map tên gốc SSI)"
+        elif BASKETS[basket_choice][0] == "ws":
+            symbols, symbol_names, source_info = get_ssi_basket(basket_choice)
         else:
-            choice_val = BASKETS[basket_choice]
-            if choice_val == "ALL_HOSE":
-                symbols = cached_market_symbols("HOSE")
-            elif choice_val == "ALL_ALL":
-                symbols = cached_market_symbols("ALL")
-            else:
-                symbols = choice_val
+            symbols, symbol_names, source_info = cached_ssi_basket(basket_choice)
 
-        st.success(f"🎯 Số lượng mã theo dõi: **{len(symbols)}** cổ phiếu")
+        st.success(f"🎯 **{len(symbols)}** cổ phiếu\n\nNguồn: *{source_info}*")
 
         st.markdown("---")
         st.markdown("### 📅 Dải Ngày Phân Tích (Tối thiểu 400 ngày)")
@@ -1011,7 +1025,7 @@ def main():
 
         realtime_on = st.toggle("⚡ Bật Realtime Trong Phiên (Live Engine)", value=feed.is_running)
         if realtime_on:
-            feed.start(symbols)
+            feed.start(symbols, basket_label=basket_choice)
             pause_live = st.checkbox(
                 "⏸️ Tạm dừng nhảy số (để soi mã)",
                 key="pause_live_view",
@@ -1022,11 +1036,11 @@ def main():
                 feed.stop()
             pause_live = False
 
-        if st.button("🔄 Tải mới toàn bộ dữ liệu", use_container_width=True):
+        if st.button("🔄 Tải mới danh mục & dữ liệu", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-    with st.spinner(f"⏳ Đang đồng bộ & tính toán chỉ báo ({len(symbols)} cổ phiếu)..."):
+    with st.spinner(f"⏳ Đang đồng bộ & tính toán chỉ báo ({len(symbols)} cổ phiếu từ SSI)..."):
         df_raw, df_vnindex, daily_base, df_hist_base = cached_market_base(tuple(symbols), fetch_start, fetch_end)
 
     if df_raw.empty:
@@ -1034,9 +1048,9 @@ def main():
         return
 
     if realtime_on and not pause_live:
-        render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+        render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, symbol_names, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
     else:
-        render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+        render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, symbol_names, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
 
 
 if __name__ == '__main__':
