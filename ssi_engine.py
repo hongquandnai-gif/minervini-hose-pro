@@ -27,7 +27,7 @@ def is_vn_market_hours() -> bool:
     return datetime.time(8, 45) <= t <= datetime.time(15, 15)
 
 
-# Tái sử dụng kết nối TCP/TLS giúp tải toàn sàn nhanh hơn 3-5 lần
+# Tái sử dụng kết nối TCP/TLS giúp tải dữ liệu nhanh gấp 3-5 lần
 HTTP_SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=1)
 HTTP_SESSION.mount("https://", _adapter)
@@ -36,7 +36,28 @@ HTTP_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 
+SSI_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://iboard.ssi.com.vn",
+    "Referer": "https://iboard.ssi.com.vn/",
+}
 
+# Tên các bảng/rổ giữ đúng tên gốc trên bảng giá SSI iBoard
+BASKETS = {
+    "HOSE": ("exchange", "hose"),
+    "VN30": ("group", "VN30"),
+    "VN100": ("group", "VN100"),
+    "VNAllShare (VNALL)": ("group", "VNALL"),
+    "VNMidCap (VNMID)": ("group", "VNMID"),
+    "VNSmallCap (VNSML)": ("group", "VNSML"),
+    "HNX": ("exchange", "hnx"),
+    "HNX30": ("group", "HNX30"),
+    "UPCOM": ("exchange", "upcom"),
+    "HOSE + HNX + UPCOM": ("all", "ALL"),
+    "📡 WebSocket SSI (Trực tiếp trong phiên)": ("ws", "WS_LIVE"),
+}
+
+# Dự phòng khẩn cấp khi server Cloud bị chặn IP hoàn toàn
 HOSE_FULL_FALLBACK = [
     "AAA", "AAM", "AAT", "ABR", "ABS", "ABT", "ACB", "ACC", "ACG", "ACL", "ADG", "ADP", "ADS", "AGG", "AGM", "AGR",
     "AMD", "ANV", "APC", "APG", "APH", "ASG", "ASM", "ASP", "AST", "BAF", "BBC", "BCE", "BCG", "BCM", "BFC", "BHN",
@@ -66,56 +87,143 @@ HOSE_FULL_FALLBACK = [
     "VTO", "VTP", "YBM", "YEG"
 ]
 
-BASKETS = {
-    "🔥 TOÀN SÀN HOSE (~400 Cổ phiếu)": "ALL_HOSE",
-    "⚡ TOÀN BỘ 3 SÀN (HOSE + HNX + UPCOM)": "ALL_ALL",
-    "VN30 (30 Cổ phiếu vốn hóa lớn HOSE)": [
-        "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
-        "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
-        "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE"
-    ],
-    "Rổ VN100 (Top 100 HOSE)": [
-        "AAA", "ACB", "ANV", "ASM", "BCG", "BCM", "BFC", "BID", "BMP", "BSI",
-        "BVH", "BWE", "CII", "CMG", "CTD", "CTG", "CTR", "CTS", "DBC", "DCM",
-        "DGC", "DGW", "DIG", "DPM", "DSE", "DXG", "DXS", "EIB", "EVF", "FPT",
-        "FRT", "FTS", "GAS", "GEX", "GMD", "GVR", "HAG", "HAH", "HCM", "HDB",
-        "HDC", "HDG", "HHV", "HPG", "HSG", "HT1", "IMP", "KBC", "KDC", "KDH",
-        "KOS", "LPB", "MBB", "MSB", "MSN", "MWG", "NAB", "NKG", "NLG", "NT2",
-        "NVL", "OCB", "ORS", "PAN", "PC1", "PDR", "PET", "PHR", "PLX", "PNJ",
-        "POW", "PPC", "PTB", "PVD", "PVT", "REE", "SAB", "SAM", "SBT", "SCS",
-        "SHB", "SJS", "SSB", "SSI", "STB", "SZC", "TCB", "TCH", "TLG", "TPB",
-        "VCB", "VCG", "VCI", "VGC", "VHC", "VHM", "VIB", "VIC", "VIX", "VJC",
-        "VND", "VNM", "VPB", "VPI", "VRE", "VSC", "VTP"
-    ],
-    "Nhóm Trụ & Thanh Khoản (Bank / Chứng / Thép / BĐS)": [
-        "SSI", "VND", "VCI", "HCM", "FTS", "BSI", "CTS", "MBS", "SHS", "ORS",
-        "VCB", "BID", "CTG", "TCB", "MBB", "VPB", "ACB", "HDB", "STB", "LPB", "SHB",
-        "HPG", "HSG", "NKG", "VGS", "VHM", "VIC", "VRE", "NVL", "PDR", "DIG", "DXG", "KDH", "NLG", "KBC"
-    ]
-}
+
+def _extract_ssi_items(items: list) -> dict:
+    """Trích xuất mã cổ phiếu và tên doanh nghiệp gốc từ JSON SSI iBoard, giữ nguyên thứ tự gốc của SSI."""
+    stock_map = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sym = str(item.get("stockSymbol") or item.get("sym") or item.get("code") or "").strip().upper()
+        if len(sym) != 3 or not sym.isalpha():
+            continue
+
+        # Lọc đúng cổ phiếu thường theo stockType của SSI (bỏ ETF, CW, trái phiếu nếu có)
+        stock_type = str(item.get("stockType") or "").strip().lower()
+        if stock_type and stock_type not in ("s", "stock", "st"):
+            continue
+
+        comp_name = str(
+            item.get("companyNameVi")
+            or item.get("companyName")
+            or item.get("companyNameEn")
+            or item.get("stockName")
+            or ""
+        ).strip()
+
+        if sym not in stock_map or (not stock_map[sym] and comp_name):
+            stock_map[sym] = comp_name
+    return stock_map
 
 
-def get_market_symbols(market_type="HOSE"):
+def _fetch_ssi_endpoint(url: str) -> dict:
     try:
-        if market_type == "HOSE":
-            url = "https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:HOSE&size=3000"
-        else:
-            url = "https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:HOSE,HNX,UPCOM&size=3000"
+        resp = HTTP_SESSION.get(url, headers=SSI_HEADERS, timeout=7)
+        if resp.status_code == 200:
+            payload = resp.json()
+            items = payload.get("data", [])
+            if isinstance(items, list) and items:
+                return _extract_ssi_items(items)
+    except Exception:
+        pass
+    return {}
 
+
+def _fetch_vnd_fallback(floors: str) -> dict:
+    try:
+        url = f"https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:{floors}&size=3000"
         resp = HTTP_SESSION.get(url, timeout=8)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
-            symbols = [
-                item.get("code", "").strip().upper()
-                for item in data
-                if len(item.get("code", "").strip()) == 3 and item.get("code", "").strip().isalpha()
-            ]
-            if len(symbols) > 200:
-                return sorted(list(set(symbols)))
+            res = {}
+            for item in data:
+                code = str(item.get("code") or "").strip().upper()
+                if len(code) == 3 and code.isalpha():
+                    res[code] = str(item.get("companyName") or item.get("shortName") or "").strip()
+            return res
     except Exception:
         pass
+    return {}
 
-    return sorted(list(set(HOSE_FULL_FALLBACK)))
+
+def get_ssi_master_names() -> dict:
+    """Lấy bảng tra cứu tên doanh nghiệp gốc toàn thị trường từ SSI iBoard (HOSE + HNX + UPCOM)."""
+    urls = [
+        "https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN",
+        "https://iboard-query.ssi.com.vn/stock/exchange/hnx?boardId=MAIN",
+        "https://iboard-query.ssi.com.vn/stock/exchange/upcom?boardId=MAIN",
+    ]
+    master = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for res in ex.map(_fetch_ssi_endpoint, urls):
+            master.update(res)
+    if not master:
+        master = _fetch_vnd_fallback("HOSE,HNX,UPCOM")
+    return master
+
+
+def get_ssi_basket(basket_label: str):
+    """
+    Trả về: (symbols_list, symbol_names_dict, source_info)
+    Ưu tiên lấy trực tiếp từ SSI iBoard + WebSocket SSI, giữ nguyên tên gốc từ SSI.
+    """
+    source_type, code = BASKETS.get(basket_label, ("exchange", "hose"))
+
+    # 1. Rổ lấy trực tiếp từ luồng WebSocket SSI
+    if source_type == "ws":
+        ws_map = feed.discover_ws_symbols(wait_seconds=3.5)
+        master_names = get_ssi_master_names()
+        if ws_map:
+            enriched = {
+                sym: (name or master_names.get(sym, ""))
+                for sym, name in ws_map.items()
+            }
+            return list(enriched.keys()), enriched, "WebSocket SSI (wss://iboard-pushstream.ssi.com.vn)"
+
+        # Ngoài giờ giao dịch WebSocket không đẩy lệnh -> lấy bảng HOSE gốc của SSI để không trống dữ liệu
+        hose_map = _fetch_ssi_endpoint("https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN")
+        if hose_map:
+            return list(hose_map.keys()), hose_map, "WebSocket ngoài giờ → Tự đồng bộ bảng HOSE gốc SSI"
+        return list(HOSE_FULL_FALLBACK), {s: "" for s in HOSE_FULL_FALLBACK}, "Dự phòng cục bộ (WebSocket & SSI không phản hồi)"
+
+    # 2. Lấy theo sàn / rổ gốc của SSI iBoard
+    stock_map = {}
+    if source_type == "exchange":
+        stock_map = _fetch_ssi_endpoint(f"https://iboard-query.ssi.com.vn/stock/exchange/{code}?boardId=MAIN")
+    elif source_type == "group":
+        stock_map = _fetch_ssi_endpoint(f"https://iboard-query.ssi.com.vn/stock/group/{code}")
+    elif source_type == "all":
+        urls = [
+            "https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN",
+            "https://iboard-query.ssi.com.vn/stock/exchange/hnx?boardId=MAIN",
+            "https://iboard-query.ssi.com.vn/stock/exchange/upcom?boardId=MAIN",
+        ]
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            for res in ex.map(_fetch_ssi_endpoint, urls):
+                stock_map.update(res)
+
+    if stock_map:
+        source_info = f"SSI iBoard Gốc ({code.upper()})"
+        # Nếu đang bật WebSocket và xem toàn thị trường, tự hợp nhất các mã mới phát hiện trên luồng WebSocket
+        ws_live = feed.get_ws_discovered_symbols()
+        if ws_live and source_type == "all":
+            added = 0
+            for sym, nm in ws_live.items():
+                if sym not in stock_map:
+                    stock_map[sym] = nm
+                    added += 1
+            if added > 0:
+                source_info += f" + {added} mã WebSocket"
+        return list(stock_map.keys()), stock_map, source_info
+
+    # 3. Fallback nếu IP Streamlit Cloud bị tường lửa SSI chặn tạm thời
+    floor_map = {"hose": "HOSE", "hnx": "HNX", "upcom": "UPCOM", "ALL": "HOSE,HNX,UPCOM"}
+    vnd_floor = floor_map.get(code, "HOSE")
+    vnd_map = _fetch_vnd_fallback(vnd_floor)
+    if vnd_map:
+        return list(vnd_map.keys()), vnd_map, f"Dự phòng VNDirect (SSI iBoard tạm không phản hồi)"
+
+    return list(HOSE_FULL_FALLBACK), {s: "" for s in HOSE_FULL_FALLBACK}, "Dự phòng danh sách HOSE cục bộ"
 
 
 def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
@@ -124,6 +232,32 @@ def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: d
     buffer_start = start_date - datetime.timedelta(days=330)
     from_ts = int(datetime.datetime.combine(buffer_start, datetime.time.min, tzinfo=VN_TZ).timestamp())
     to_ts = int(datetime.datetime.combine(end_date, datetime.time.max, tzinfo=VN_TZ).timestamp())
+
+    # Ưu tiên SSI Chart API trước, fallback sang VNDirect Chart API
+    ssi_sym = "VN-INDEX" if sym == "VNINDEX" else sym
+    ssi_url = f"https://iboard-api.ssi.com.vn/statistics/charts/history?resolution=1D&symbol={ssi_sym}&from={from_ts}&to={to_ts}"
+    try:
+        resp = HTTP_SESSION.get(ssi_url, headers=SSI_HEADERS, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json().get("data", resp.json())
+            if isinstance(data, dict) and data.get("s") == "ok" and data.get("t"):
+                vn_dates = pd.to_datetime(pd.Series(data["t"], dtype="int64") + 25200, unit="s").dt.normalize()
+                df = pd.DataFrame({
+                    "Date": vn_dates,
+                    "Ticker": sym,
+                    "Open": pd.to_numeric(data["o"], errors="coerce"),
+                    "High": pd.to_numeric(data["h"], errors="coerce"),
+                    "Low": pd.to_numeric(data["l"], errors="coerce"),
+                    "Close": pd.to_numeric(data["c"], errors="coerce"),
+                    "Volume": pd.to_numeric(data["v"], errors="coerce")
+                })
+                if sym != "VNINDEX" and df["Close"].median() > 300:
+                    for col in ["Open", "High", "Low", "Close"]:
+                        df[col] = df[col] / 1000.0
+                df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+                return df
+    except Exception:
+        pass
 
     vnd_url = f"https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol={sym}&from={from_ts}&to={to_ts}"
     try:
@@ -141,31 +275,6 @@ def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: d
                     "Close": pd.to_numeric(data["c"], errors="coerce"),
                     "Volume": pd.to_numeric(data["v"], errors="coerce")
                 })
-                df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-                return df
-    except Exception:
-        pass
-
-    ssi_sym = "VN-INDEX" if sym == "VNINDEX" else sym
-    ssi_url = f"https://iboard-api.ssi.com.vn/statistics/charts/history?resolution=1D&symbol={ssi_sym}&from={from_ts}&to={to_ts}"
-    try:
-        resp = HTTP_SESSION.get(ssi_url, headers={"Referer": "https://iboard.ssi.com.vn/"}, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json().get("data", resp.json())
-            if data.get("s") == "ok" and data.get("t"):
-                vn_dates = pd.to_datetime(pd.Series(data["t"], dtype="int64") + 25200, unit="s").dt.normalize()
-                df = pd.DataFrame({
-                    "Date": vn_dates,
-                    "Ticker": sym,
-                    "Open": pd.to_numeric(data["o"], errors="coerce"),
-                    "High": pd.to_numeric(data["h"], errors="coerce"),
-                    "Low": pd.to_numeric(data["l"], errors="coerce"),
-                    "Close": pd.to_numeric(data["c"], errors="coerce"),
-                    "Volume": pd.to_numeric(data["v"], errors="coerce")
-                })
-                if sym != "VNINDEX" and df["Close"].median() > 300:
-                    for col in ["Open", "High", "Low", "Close"]:
-                        df[col] = df[col] / 1000.0
                 df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
                 return df
     except Exception:
@@ -201,7 +310,9 @@ def fetch_ssi_basket_history(symbols: list, start_date: datetime.date, end_date:
 
 class SSIRealtimeFeed:
     """
-    Hybrid Realtime Engine chuẩn hóa UTC+7, chống Zombie Thread và hỗ trợ cả 3 sàn.
+    Hybrid Realtime Engine SSI:
+    - WebSocket Pushstream (wss://iboard-pushstream.ssi.com.vn/realtime): tự ghi nhận danh sách mã trực tiếp + nhận tick.
+    - SSI iBoard Snapshot Polling: đồng bộ đầy đủ HOSE/HNX/UPCOM và tên doanh nghiệp gốc.
     """
     _instance = None
     _lock = threading.Lock()
@@ -215,15 +326,54 @@ class SSIRealtimeFeed:
                 cls._instance.ws_thread = None
                 cls._instance.poll_thread = None
                 cls._instance.market_data = {}
+                cls._instance.ws_discovered_symbols = {}
                 cls._instance.active_symbols = list(HOSE_FULL_FALLBACK)
+                cls._instance.active_exchanges = ["hose"]
                 cls._instance.source_name = "Đang khởi tạo..."
                 cls._instance.last_sync_str = "--:--:--"
                 cls._instance.data_lock = threading.Lock()
         return cls._instance
 
-    def set_symbols(self, symbols: list):
+    def set_symbols(self, symbols: list, basket_label: str = "HOSE"):
         if symbols:
-            self.active_symbols = list(set(symbols))
+            self.active_symbols = list(dict.fromkeys(symbols))
+        if basket_label in ("HNX", "HNX30"):
+            self.active_exchanges = ["hnx"]
+        elif basket_label == "UPCOM":
+            self.active_exchanges = ["upcom"]
+        elif "HNX" in basket_label or "WS" in basket_label or "WebSocket" in basket_label:
+            self.active_exchanges = ["hose", "hnx", "upcom"]
+        else:
+            self.active_exchanges = ["hose"]
+
+    def _record_ws_symbol(self, ticker: str, company_name: str = ""):
+        ticker = str(ticker).strip().upper()
+        if len(ticker) == 3 and ticker.isalpha():
+            with self.data_lock:
+                if ticker not in self.ws_discovered_symbols or (company_name and not self.ws_discovered_symbols[ticker]):
+                    self.ws_discovered_symbols[ticker] = company_name
+
+    def get_ws_discovered_symbols(self) -> dict:
+        with self.data_lock:
+            return dict(self.ws_discovered_symbols)
+
+    def discover_ws_symbols(self, wait_seconds: float = 3.5) -> dict:
+        """Kết nối WebSocket SSI để thu thập trực tiếp danh sách mã đang chạy trên luồng Pushstream."""
+        existing = self.get_ws_discovered_symbols()
+        if len(existing) >= 10:
+            return existing
+
+        was_running = self.is_running
+        if not was_running:
+            self.start()
+
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if len(self.get_ws_discovered_symbols()) >= 30:
+                break
+            time.sleep(0.25)
+
+        return self.get_ws_discovered_symbols()
 
     def _normalize_and_store(
             self,
@@ -267,22 +417,14 @@ class SSIRealtimeFeed:
             }
 
     def _poll_ssi_iboard_snapshot(self) -> int:
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Origin": "https://iboard.ssi.com.vn",
-            "Referer": "https://iboard.ssi.com.vn/"
-        }
-        urls = ["https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN"]
-        if len(self.active_symbols) > 450:
-            urls.extend([
-                "https://iboard-query.ssi.com.vn/stock/exchange/hnx?boardId=MAIN",
-                "https://iboard-query.ssi.com.vn/stock/exchange/upcom?boardId=MAIN"
-            ])
-
+        urls = [
+            f"https://iboard-query.ssi.com.vn/stock/exchange/{ex}?boardId=MAIN"
+            for ex in self.active_exchanges
+        ]
         count = 0
         for url in urls:
             try:
-                resp = HTTP_SESSION.get(url, headers=headers, timeout=4)
+                resp = HTTP_SESSION.get(url, headers=SSI_HEADERS, timeout=4)
                 if resp.status_code == 200:
                     items = resp.json().get("data", [])
                     if isinstance(items, list) and len(items) > 0:
@@ -375,27 +517,46 @@ class SSIRealtimeFeed:
                 time.sleep(3)
 
     def on_message(self, ws, message):
-        if not is_vn_market_hours():
-            return
         try:
             if isinstance(message, bytes):
                 message = message.decode("utf-8", errors="ignore")
+
+            # Hỗ trợ cả định dạng JSON lẫn định dạng chuỗi phân cách '|' của SSI Pushstream
+            if isinstance(message, str) and message.startswith("S#"):
+                parts = message.split("|")
+                if parts:
+                    raw_sym = parts[0].replace("S#", "").strip().upper()
+                    self._record_ws_symbol(raw_sym)
+                return
+
             data = json.loads(message)
             payload = data.get("data", data)
-            if isinstance(payload, dict):
-                ticker = payload.get("sym") or payload.get("stockSymbol") or payload.get("symbol") or payload.get(
-                    "indexId")
-                if ticker:
-                    raw_price = float(payload.get("lastPrice") or payload.get("matchedPrice") or payload.get(
-                        "matchPrice") or payload.get("price") or payload.get("indexValue") or 0)
-                    vol = float(
-                        payload.get("totalVol") or payload.get("nmTotalTradedQty") or payload.get("totalVolume") or 0)
-                    high = float(payload.get("highPrice") or payload.get("highest") or raw_price)
-                    low = float(payload.get("lowPrice") or payload.get("lowest") or raw_price)
-                    if raw_price > 0 and vol > 0:
-                        self._normalize_and_store(ticker, raw_price, vol, high, low, is_vnd_unit=True)
-                        self.source_name = "SSI Pushstream WSS"
-                        self.last_sync_str = get_vn_now().strftime("%H:%M:%S")
+            items = payload if isinstance(payload, list) else ([payload] if isinstance(payload, dict) else [])
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ticker = item.get("sym") or item.get("stockSymbol") or item.get("symbol") or item.get("indexId")
+                if not ticker:
+                    continue
+
+                comp_name = str(item.get("companyNameVi") or item.get("companyName") or "").strip()
+                self._record_ws_symbol(ticker, comp_name)
+
+                if not is_vn_market_hours():
+                    continue
+
+                raw_price = float(
+                    item.get("lastPrice") or item.get("matchedPrice") or item.get("matchPrice")
+                    or item.get("price") or item.get("indexValue") or 0
+                )
+                vol = float(item.get("totalVol") or item.get("nmTotalTradedQty") or item.get("totalVolume") or 0)
+                high = float(item.get("highPrice") or item.get("highest") or raw_price)
+                low = float(item.get("lowPrice") or item.get("lowest") or raw_price)
+                if raw_price > 0 and vol > 0:
+                    self._normalize_and_store(ticker, raw_price, vol, high, low, is_vnd_unit=True)
+                    self.source_name = "SSI Pushstream WSS"
+                    self.last_sync_str = get_vn_now().strftime("%H:%M:%S")
         except Exception:
             pass
 
@@ -425,9 +586,9 @@ class SSIRealtimeFeed:
                 pass
             time.sleep(5)
 
-    def start(self, symbols=None):
+    def start(self, symbols=None, basket_label: str = "HOSE"):
         if symbols:
-            self.set_symbols(symbols)
+            self.set_symbols(symbols, basket_label=basket_label)
         with self._lock:
             if not self.is_running:
                 self.is_running = True
