@@ -143,86 +143,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- 2. CACHE DỮ LIỆU CHUNG TRÊN CLOUD (TIẾT KIỆM RAM & TĂNG TỐC) ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_market_symbols(market_type: str):
-    return get_market_symbols(market_type)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_market_history(symbols_tuple: tuple, start_d: datetime.date, end_d: datetime.date):
-    df_r = fetch_ssi_basket_history(list(symbols_tuple), start_d, end_d, max_workers=20)
-    df_v = fetch_ssi_symbol_history("VNINDEX", start_d, end_d)
-    return df_r, df_v
-
-
-# --- 3. XỬ LÝ DỮ LIỆU & CHỐNG NHIỄU GIÁ REALTIME (SANITY GUARD) ---
-def process_market_and_stocks(df_raw, df_vnindex, rt_ticks=None):
-    df = df_raw.copy()
-    max_market_date = df['Date'].max()
-    vn_today_ts = pd.Timestamp(get_vn_today())
-
-    if rt_ticks:
-        last_indices = df.groupby('Ticker')['Date'].idxmax()
-        new_rows = []
-        for idx in last_indices:
-            tk = df.at[idx, 'Ticker']
-            if tk in rt_ticks:
-                t = rt_ticks[tk]
-                prev_close = float(df.at[idx, 'Close'])
-                if prev_close <= 0:
-                    continue
-
-                t_price = float(t['price'])
-                t_high = float(t['high'])
-                t_low = float(t['low'])
-                t_open = float(t.get('open', t_price))
-                t_vol = float(t.get('volume', 0))
-
-                if t_price / prev_close > 100:
-                    t_price /= 1000.0
-                    t_high /= 1000.0
-                    t_low /= 1000.0
-                    t_open /= 1000.0
-
-                if t_price <= 0 or abs(t_price - prev_close) / prev_close > 0.20:
-                    continue
-
-                if t_high <= 0 or abs(t_high - t_price) / t_price > 0.20:
-                    t_high = t_price
-                if t_low <= 0 or abs(t_low - t_price) / t_price > 0.20:
-                    t_low = t_price
-                if t_open <= 0 or abs(t_open - t_price) / t_price > 0.20:
-                    t_open = t_price
-
-                t_high = max(t_high, t_price, t_open)
-                t_low = min(t_low, t_price, t_open)
-
-                tick_date = pd.Timestamp(t.get('date', max_market_date)).normalize()
-                last_date = pd.Timestamp(df.at[idx, 'Date']).normalize()
-
-                if tick_date > last_date and tick_date <= vn_today_ts:
-                    new_rows.append({
-                        'Date': tick_date,
-                        'Ticker': tk,
-                        'Open': round(t_open, 2),
-                        'High': round(t_high, 2),
-                        'Low': round(t_low, 2),
-                        'Close': round(t_price, 2),
-                        'Volume': t_vol
-                    })
-                elif tick_date == last_date:
-                    df.at[idx, 'Close'] = round(t_price, 2)
-                    df.at[idx, 'High'] = round(max(df.at[idx, 'High'], t_high), 2)
-                    df.at[idx, 'Low'] = round(min(df.at[idx, 'Low'], t_low), 2)
-                    if t_vol > 0:
-                        df.at[idx, 'Volume'] = max(df.at[idx, 'Volume'], t_vol)
-
-        if new_rows:
-            df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-            df.sort_values(by=['Ticker', 'Date'], inplace=True)
-            df.reset_index(drop=True, inplace=True)
-
+# --- 2. HÀM TÍNH CHỈ BÁO & CACHE NỀN (CHỈ TÍNH 1 LẦN, TĂNG TỐC X10) ---
+def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     grouped = df.groupby('Ticker', sort=False)
     for ma in [20, 50, 150, 200]:
         df[f'MA{ma}'] = grouped['Close'].rolling(ma).mean().reset_index(level=0, drop=True)
@@ -250,17 +172,21 @@ def process_market_and_stocks(df_raw, df_vnindex, rt_ticks=None):
 
     df['Pct_From_Bottom'] = np.where(df['Bottom_52W'] > 0, ((c - df['Bottom_52W']) / df['Bottom_52W']) * 100, np.nan)
     df['Pct_From_Peak'] = np.where(df['Peak_52W'] > 0, ((c - df['Peak_52W']) / df['Peak_52W']) * 100, np.nan)
+    return df
 
-    df['Has_52W'] = df['Bottom_52W'].notna().astype(int)
-    df['Is_Bottoming'] = ((df['Pct_From_Bottom'] <= 10) & df['Bottom_52W'].notna()).astype(int)
 
-    df['Above_MA200'] = ((df['Close'] > df['MA200']) & df['MA200'].notna()).astype(int)
-    df['Has_MA200'] = df['MA200'].notna().astype(int)
-
-    df['Below_MA20'] = ((df['Close'] < df['MA20']) & df['MA20'].notna()).astype(int)
-    df['Has_MA20'] = df['MA20'].notna().astype(int)
-
-    daily = df.groupby('Date').agg(
+def _aggregate_daily_breadth(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = pd.DataFrame({
+        'Date': df['Date'],
+        'Close': df['Close'],
+        'Has_52W': df['Bottom_52W'].notna().astype('int8'),
+        'Is_Bottoming': ((df['Pct_From_Bottom'] <= 10) & df['Bottom_52W'].notna()).astype('int8'),
+        'Above_MA200': ((df['Close'] > df['MA200']) & df['MA200'].notna()).astype('int8'),
+        'Has_MA200': df['MA200'].notna().astype('int8'),
+        'Below_MA20': ((df['Close'] < df['MA20']) & df['MA20'].notna()).astype('int8'),
+        'Has_MA20': df['MA20'].notna().astype('int8'),
+    })
+    daily = tmp.groupby('Date').agg(
         avg_price=('Close', 'mean'),
         total_with_52w=('Has_52W', 'sum'),
         total_with_ma=('Has_MA200', 'sum'),
@@ -270,34 +196,138 @@ def process_market_and_stocks(df_raw, df_vnindex, rt_ticks=None):
         bottoming=('Is_Bottoming', 'sum')
     ).reset_index()
 
-    daily['pct_above_ma'] = np.where(
-        daily['total_with_ma'] > 0,
-        (daily['above_ma'] / daily['total_with_ma']) * 100,
-        np.nan
-    )
-    daily['pct_below_ma20'] = np.where(
-        daily['total_with_ma20'] > 0,
-        (daily['below_ma20'] / daily['total_with_ma20']) * 100,
-        np.nan
-    )
-    daily['pct_bottoming'] = np.where(
-        daily['total_with_52w'] > 0,
-        (daily['bottoming'] / daily['total_with_52w']) * 100,
-        np.nan
-    )
+    daily['pct_above_ma'] = np.where(daily['total_with_ma'] > 0, (daily['above_ma'] / daily['total_with_ma']) * 100, np.nan)
+    daily['pct_below_ma20'] = np.where(daily['total_with_ma20'] > 0, (daily['below_ma20'] / daily['total_with_ma20']) * 100, np.nan)
+    daily['pct_bottoming'] = np.where(daily['total_with_52w'] > 0, (daily['bottoming'] / daily['total_with_52w']) * 100, np.nan)
+    return daily
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_market_symbols(market_type: str):
+    return get_market_symbols(market_type)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_market_base(symbols_tuple: tuple, start_d: datetime.date, end_d: datetime.date):
+    df_raw = fetch_ssi_basket_history(list(symbols_tuple), start_d, end_d, max_workers=24)
+    df_vnindex = fetch_ssi_symbol_history("VNINDEX", start_d, end_d)
+    if df_raw.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df_hist_base = _compute_indicators(df_raw.copy())
+    daily_base = _aggregate_daily_breadth(df_hist_base)
 
     if not df_vnindex.empty:
         vni_map = df_vnindex.set_index('Date')['Close'].to_dict()
-        daily['hose_index'] = daily['Date'].map(vni_map).ffill().bfill()
-        if rt_ticks and "VNINDEX" in rt_ticks:
-            vni_rt = float(rt_ticks["VNINDEX"]['price'])
-            last_vni = float(daily['hose_index'].iloc[-1])
-            if last_vni > 0 and abs(vni_rt - last_vni) / last_vni <= 0.10:
-                daily.loc[daily.index[-1], 'hose_index'] = vni_rt
+        daily_base['hose_index'] = daily_base['Date'].map(vni_map).ffill().bfill()
     else:
-        daily['hose_index'] = daily['avg_price']
+        daily_base['hose_index'] = daily_base['avg_price']
 
-    return daily, df
+    return df_raw, df_vnindex, daily_base, df_hist_base
+
+
+# --- 3. CẬP NHẬT REALTIME TỐC ĐỘ CAO (CHỈ TÍNH LÁT CẮT 265 PHIÊN CUỐI) ---
+def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=None):
+    if not rt_ticks:
+        return daily_base, df_hist_base
+
+    # Chỉ cắt 265 phiên gần nhất của mỗi mã (đủ tính MA200, shift(252), 52W, VCP và đồ thị 160 phiên)
+    df_tail = df_raw.groupby('Ticker', sort=False).tail(265).copy().reset_index(drop=True)
+    max_market_date = df_tail['Date'].max()
+    vn_today_ts = pd.Timestamp(get_vn_today())
+
+    last_indices = df_tail.groupby('Ticker')['Date'].idxmax()
+    new_rows = []
+    updated_any = False
+
+    for idx in last_indices:
+        tk = df_tail.at[idx, 'Ticker']
+        if tk in rt_ticks:
+            t = rt_ticks[tk]
+            prev_close = float(df_tail.at[idx, 'Close'])
+            if prev_close <= 0:
+                continue
+
+            t_price = float(t['price'])
+            t_high = float(t['high'])
+            t_low = float(t['low'])
+            t_open = float(t.get('open', t_price))
+            t_vol = float(t.get('volume', 0))
+
+            if t_price / prev_close > 100:
+                t_price /= 1000.0
+                t_high /= 1000.0
+                t_low /= 1000.0
+                t_open /= 1000.0
+
+            if t_price <= 0 or abs(t_price - prev_close) / prev_close > 0.20:
+                continue
+
+            if t_high <= 0 or abs(t_high - t_price) / t_price > 0.20:
+                t_high = t_price
+            if t_low <= 0 or abs(t_low - t_price) / t_price > 0.20:
+                t_low = t_price
+            if t_open <= 0 or abs(t_open - t_price) / t_price > 0.20:
+                t_open = t_price
+
+            t_high = max(t_high, t_price, t_open)
+            t_low = min(t_low, t_price, t_open)
+
+            tick_date = pd.Timestamp(t.get('date', max_market_date)).normalize()
+            last_date = pd.Timestamp(df_tail.at[idx, 'Date']).normalize()
+
+            if tick_date > last_date and tick_date <= vn_today_ts:
+                new_rows.append({
+                    'Date': tick_date,
+                    'Ticker': tk,
+                    'Open': round(t_open, 2),
+                    'High': round(t_high, 2),
+                    'Low': round(t_low, 2),
+                    'Close': round(t_price, 2),
+                    'Volume': t_vol
+                })
+                updated_any = True
+            elif tick_date == last_date:
+                df_tail.at[idx, 'Close'] = round(t_price, 2)
+                df_tail.at[idx, 'High'] = round(max(df_tail.at[idx, 'High'], t_high), 2)
+                df_tail.at[idx, 'Low'] = round(min(df_tail.at[idx, 'Low'], t_low), 2)
+                if t_vol > 0:
+                    df_tail.at[idx, 'Volume'] = max(df_tail.at[idx, 'Volume'], t_vol)
+                updated_any = True
+
+    if not updated_any and "VNINDEX" not in rt_ticks:
+        return daily_base, df_hist_base
+
+    if new_rows:
+        df_tail = pd.concat([df_tail, pd.DataFrame(new_rows)], ignore_index=True)
+        df_tail.sort_values(by=['Ticker', 'Date'], inplace=True)
+        df_tail.reset_index(drop=True, inplace=True)
+
+    df_tail = _compute_indicators(df_tail)
+
+    # Chỉ cập nhật lại độ rộng cho ngày cuối cùng trở đi, giữ nguyên toàn bộ lịch sử daily_base
+    last_base_date = daily_base['Date'].max()
+    recent_slice = df_tail[df_tail['Date'] >= last_base_date]
+    daily_recent = _aggregate_daily_breadth(recent_slice)
+
+    daily_out = daily_base[daily_base['Date'] < last_base_date].copy()
+    daily_out = pd.concat([daily_out, daily_recent], ignore_index=True)
+    daily_out.sort_values(by='Date', inplace=True)
+    daily_out.reset_index(drop=True, inplace=True)
+
+    if not df_vnindex.empty:
+        vni_map = df_vnindex.set_index('Date')['Close'].to_dict()
+        daily_out['hose_index'] = daily_out['Date'].map(vni_map).ffill().bfill()
+        if "VNINDEX" in rt_ticks:
+            vni_rt = float(rt_ticks["VNINDEX"]['price'])
+            vni_dt = pd.Timestamp(rt_ticks["VNINDEX"].get('date', daily_out['Date'].iloc[-1])).normalize()
+            last_vni = float(daily_out['hose_index'].iloc[-1])
+            if vni_dt == daily_out['Date'].iloc[-1] and last_vni > 0 and abs(vni_rt - last_vni) / last_vni <= 0.10:
+                daily_out.loc[daily_out.index[-1], 'hose_index'] = vni_rt
+    else:
+        daily_out['hose_index'] = daily_out['avg_price']
+
+    return daily_out, df_tail
 
 
 # --- 4. BỘ LỌC MINERVINI & VCP ---
@@ -325,7 +355,7 @@ def filter_minervini_stocks(sf, min_rs=60, min_vol=0):
 
 def detect_vcp_pattern(stock_data, current_date, lookback_days=150):
     data = stock_data[(stock_data['Date'] <= current_date) &
-                      (stock_data['Date'] >= (current_date - pd.Timedelta(days=lookback_days)))].copy()
+                      (stock_data['Date'] >= (current_date - pd.Timedelta(days=lookback_days)))]
     if len(data) < 35:
         return None
 
@@ -432,6 +462,9 @@ def evaluate_stock_phase(tk):
     close, ma50 = tk['Close'], tk['MA50']
     pct_from_peak, pct_from_bottom = tk['Pct_From_Peak'], tk['Pct_From_Bottom']
 
+    if pd.isna(ma200) or pd.isna(ma50):
+        return "CHƯA ĐỦ DỮ LIỆU MA200", "#64748b", "Cổ phiếu mới niêm yết hoặc chưa đủ lịch sử 200 phiên giao dịch để phân loại chu kỳ."
+
     if close > ma50 and ma50 > ma200 and close > ma200 and ma200_slope >= 0:
         if pct_from_bottom >= 25 and pct_from_peak >= -25:
             return "GIAI ĐOẠN 2 (TĂNG TỐC - UPTREND MẠNH)", "#10b981", "Cổ phiếu đạt chuẩn Stage 2 của Minervini: Cấu trúc xu hướng hoàn hảo, MA dốc lên, sát đỉnh 52 tuần. Ưu tiên điểm MUA theo đà tăng."
@@ -451,16 +484,21 @@ def evaluate_stock_phase(tk):
     return "GIAI ĐOẠN 4 (SUY THOÁI)", "#ef4444", "Xu hướng giảm chi phối, giá nằm dưới MA200."
 
 
+def fmt_num(val, fmt="{:.2f}"):
+    return "-" if pd.isna(val) else fmt.format(val)
+
+
 def render_metric_card(title, value, delta_val, delta_text, is_percentage=False, invert_color=False, icon=""):
     d_class, d_sign = "badge-neutral", ""
-    if delta_val > 0:
-        d_class = "badge-down" if invert_color else "badge-up"
-        d_sign = "▲"
-    elif delta_val < 0:
-        d_class = "badge-up" if invert_color else "badge-down"
-        d_sign = "▼"
-    val_str = f"{value:.2f}%" if is_percentage else f"{value:,.2f}"
-    delta_str = f"{abs(delta_val):.2f}%" if is_percentage else f"{abs(delta_val):,.2f}"
+    if pd.notna(delta_val):
+        if delta_val > 0:
+            d_class = "badge-down" if invert_color else "badge-up"
+            d_sign = "▲"
+        elif delta_val < 0:
+            d_class = "badge-up" if invert_color else "badge-down"
+            d_sign = "▼"
+    val_str = fmt_num(value, "{:.2f}%") if is_percentage else fmt_num(value, "{:,.2f}")
+    delta_str = fmt_num(abs(delta_val), "{:.2f}%") if (pd.notna(delta_val) and is_percentage) else fmt_num(abs(delta_val) if pd.notna(delta_val) else np.nan, "{:,.2f}")
     html = f"""<div class="metric-card"><div class="metric-title">{icon} {title}</div><div class="metric-value">{val_str}</div><div class="metric-delta"><span class="{d_class}">{d_sign} {delta_str}</span> <span style="color:#94a3b8; font-weight:500; font-size:0.72rem; margin-left:4px;">{delta_text}</span></div></div>"""
     st.markdown(html, unsafe_allow_html=True)
 
@@ -479,12 +517,14 @@ def highlight_rs(val):
 
 
 # --- 5. DASHBOARD REALTIME AUTO-REFRESH FRAGMENT ---
-def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
-    rt_ticks = feed.get_all_realtime() if feed.is_running else {}
-    daily_all, df_history = process_market_and_stocks(df_raw, df_vnindex, rt_ticks)
+def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
+    vn_today = get_vn_today()
+    # Chỉ trộn tick realtime khi đang bật Live và ngày kết thúc bao gồm hôm nay
+    rt_ticks = feed.get_all_realtime() if (feed.is_running and fetch_end >= vn_today) else {}
+    daily_all, df_history = apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks)
 
     start_ts = pd.to_datetime(fetch_start)
-    end_ts = pd.to_datetime(max(fetch_end, get_vn_today()))
+    end_ts = pd.to_datetime(max(fetch_end, vn_today) if rt_ticks else fetch_end)
     data_plot = daily_all[(daily_all['Date'] >= start_ts) & (daily_all['Date'] <= end_ts)].copy()
 
     if data_plot.empty:
@@ -528,7 +568,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
 
     status_line = ""
     if feed.is_running:
-        paused_tag = " (ĐANG TẠM DỪNG MÀN HÌNH)" if st.session_state.get("pause_live_view", False) else ""
+        paused_tag = " (ĐÃ TẠM DỪNG MÀN HÌNH)" if st.session_state.get("pause_live_view", False) else ""
         status_line += (
             f"<div class='live-indicator'><div class='pulse-dot'></div> "
             f"LIVE TRONG PHIÊN{paused_tag}: {len(rt_ticks)} mã nhận tick • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
@@ -696,7 +736,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
         st.markdown(f"### 🏆 Bảng Xếp Hạng Cổ Phiếu Dẫn Dắt (Ngày {actual_eval_date.strftime('%d/%m/%Y')})")
         col_f1, _ = st.columns([1, 3])
         with col_f1:
-            rs_threshold = st.slider("Lọc theo RS Rating tối thiểu:", min_value=50, max_value=95, value=70, step=5)
+            rs_threshold = st.slider("Lọc theo RS Rating tối thiểu:", min_value=50, max_value=95, value=70, step=5, key="rs_threshold_slider")
 
         if not latest_data.empty:
             minervini_stocks = filter_minervini_stocks(latest_data, min_rs=rs_threshold, min_vol=min_vol_filter)
@@ -718,7 +758,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                         'Giá Hiện Tại': '{:.2f}', 'MA20': '{:.2f}', 'MA50': '{:.2f}', 'MA150': '{:.2f}', 'MA200': '{:.2f}',
                         '% Từ Đỉnh 52T': '{:.1f}%', '% Hồi Từ Đáy 52T': '{:.1f}%',
                         'RS Rating': '{:.0f}', 'KLGD TB 20P': '{:,.0f}'
-                    })
+                    }, na_rep="-")
                 st.dataframe(styled_df, use_container_width=True, height=450, hide_index=True)
             else:
                 st.warning(
@@ -779,7 +819,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
         if 'selected_diag_ticker' not in st.session_state or st.session_state['selected_diag_ticker'] not in ordered_tickers:
             st.session_state['selected_diag_ticker'] = ordered_tickers[0] if ordered_tickers else None
 
-        col_sel1, col_sel2, col_sel3 = st.columns([2, 1.2, 0.8])
+        col_sel1, col_sel2 = st.columns([2, 1])
         with col_sel1:
             selected_ticker = st.selectbox(
                 "Chọn hoặc gõ mã cổ phiếu muốn phân tích:",
@@ -794,13 +834,6 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                 key="diag_chart_type",
                 horizontal=True
             )
-        with col_sel3:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            st.checkbox(
-                "⏸️ Tạm dừng nhảy số",
-                key="pause_live_view",
-                help="Giữ yên màn hình để gõ mã và soi nến mượt hơn khi đang bật Realtime"
-            )
 
         if selected_ticker:
             tk_data = latest_data[latest_data['Ticker'] == selected_ticker]
@@ -808,7 +841,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                 tk = tk_data.iloc[0]
                 phase_title, phase_color, phase_desc = evaluate_stock_phase(tk)
 
-                stock_history = df_history[df_history['Ticker'] == selected_ticker].copy()
+                stock_history = df_history[df_history['Ticker'] == selected_ticker]
                 vcp_diag = detect_vcp_pattern(stock_history, actual_eval_date, lookback_days=150)
 
                 st.markdown(f"""
@@ -830,28 +863,28 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                 colA, colB, colC = st.columns(3)
                 with colA:
                     st.markdown("**Cấu trúc Xu hướng & MA:**")
-                    st.write(
-                        f"- Giá ({tk['Close']:.2f}) vs MA20 ({tk['MA20']:.2f}): {'✅ Nằm trên' if tk['Close'] >= tk['MA20'] else '❌ Gãy MA20'}")
-                    st.write(
-                        f"- Giá vs MA50 ({tk['MA50']:.2f}): {'✅ Nằm trên' if tk['Close'] > tk['MA50'] else '❌ Nằm dưới'}")
-                    st.write(
-                        f"- Giá vs MA150 & MA200: {'✅ Nằm trên' if (tk['Close'] > tk['MA150'] and tk['Close'] > tk['MA200']) else '❌ Nằm dưới'}")
+                    ma20_ok = pd.notna(tk['MA20']) and tk['Close'] >= tk['MA20']
+                    ma50_ok = pd.notna(tk['MA50']) and tk['Close'] > tk['MA50']
+                    ma_long_ok = pd.notna(tk['MA150']) and pd.notna(tk['MA200']) and tk['Close'] > tk['MA150'] and tk['Close'] > tk['MA200']
+                    st.write(f"- Giá ({fmt_num(tk['Close'])}) vs MA20 ({fmt_num(tk['MA20'])}): {'✅ Nằm trên' if ma20_ok else '❌ Gãy MA20'}")
+                    st.write(f"- Giá vs MA50 ({fmt_num(tk['MA50'])}): {'✅ Nằm trên' if ma50_ok else '❌ Nằm dưới'}")
+                    st.write(f"- Giá vs MA150 & MA200: {'✅ Nằm trên' if ma_long_ok else '❌ Nằm dưới'}")
                 with colB:
                     st.markdown("**Vị thế Đỉnh / Đáy 52 Tuần:**")
-                    st.write(f"- Đỉnh 52T: **{tk['Peak_52W']:.2f}** (Cách: **{tk['Pct_From_Peak']:.1f}%**)")
-                    st.write(f"- Đáy 52T: **{tk['Bottom_52W']:.2f}** (Cách: **+{tk['Pct_From_Bottom']:.1f}%**)")
-                    st.write(
-                        f"- Độ dốc MA200: {'✅ Dốc lên' if tk['MA200'] > tk['MA200_20D_ago'] else '❌ Đi ngang / Dốc xuống'}")
+                    st.write(f"- Đỉnh 52T: **{fmt_num(tk['Peak_52W'])}** (Cách: **{fmt_num(tk['Pct_From_Peak'], '{:.1f}%')}**)")
+                    st.write(f"- Đáy 52T: **{fmt_num(tk['Bottom_52W'])}** (Cách: **+{fmt_num(tk['Pct_From_Bottom'], '{:.1f}%')}**)")
+                    ma200_up = pd.notna(tk['MA200']) and pd.notna(tk['MA200_20D_ago']) and tk['MA200'] > tk['MA200_20D_ago']
+                    st.write(f"- Độ dốc MA200: {'✅ Dốc lên' if ma200_up else '❌ Đi ngang / Dốc xuống'}")
                 with colC:
                     st.markdown("**Sức mạnh & Thanh khoản:**")
                     st.markdown(
                         f"Điểm RS Rating: <span style='font-size:1.4rem; font-weight:800; color:#8b5cf6;'>{tk['RS_Rating']}</span> / 99",
                         unsafe_allow_html=True)
-                    st.write(f"- KLGD phiên: **{tk['Volume']:,.0f}** CP")
-                    st.write(f"- KLGD TB 20P: **{tk['Vol_MA20']:,.0f}** CP")
+                    st.write(f"- KLGD phiên: **{fmt_num(tk['Volume'], '{:,.0f}')}** CP")
+                    st.write(f"- KLGD TB 20P: **{fmt_num(tk['Vol_MA20'], '{:,.0f}')}** CP")
 
                 st.markdown("<br>", unsafe_allow_html=True)
-                stock_plot = stock_history[stock_history['Date'] <= actual_eval_date].tail(160).copy()
+                stock_plot = stock_history[stock_history['Date'] <= actual_eval_date].tail(160)
 
                 if not stock_plot.empty:
                     fig_stock = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
@@ -913,8 +946,8 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
 
 
 @st.fragment(run_every="10s")
-def render_live_fragment(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
-    render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+def render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
+    render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
 
 
 # --- 6. GIAO DIỆN CHÍNH ---
@@ -979,24 +1012,31 @@ def main():
         realtime_on = st.toggle("⚡ Bật Realtime Trong Phiên (Live Engine)", value=feed.is_running)
         if realtime_on:
             feed.start(symbols)
-        elif not realtime_on and feed.is_running:
-            feed.stop()
+            pause_live = st.checkbox(
+                "⏸️ Tạm dừng nhảy số (để soi mã)",
+                key="pause_live_view",
+                help="Dừng làm mới màn hình để gõ mã và soi biểu đồ mượt hơn, luồng dữ liệu vẫn chạy ngầm"
+            )
+        else:
+            if feed.is_running:
+                feed.stop()
+            pause_live = False
 
         if st.button("🔄 Tải mới toàn bộ dữ liệu", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-    with st.spinner(f"⏳ Đang đồng bộ dữ liệu lịch sử ({len(symbols)} cổ phiếu) từ máy chủ..."):
-        df_raw, df_vnindex = cached_market_history(tuple(symbols), fetch_start, fetch_end)
+    with st.spinner(f"⏳ Đang đồng bộ & tính toán chỉ báo ({len(symbols)} cổ phiếu)..."):
+        df_raw, df_vnindex, daily_base, df_hist_base = cached_market_base(tuple(symbols), fetch_start, fetch_end)
 
     if df_raw.empty:
         st.error("⚠️ Không tải được dữ liệu từ API. Vui lòng kiểm tra lại kết nối mạng!")
         return
 
-    if realtime_on and not st.session_state.get("pause_live_view", False):
-        render_live_fragment(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+    if realtime_on and not pause_live:
+        render_live_fragment(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
     else:
-        render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
+        render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
 
 
 if __name__ == '__main__':
