@@ -528,9 +528,10 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
 
     status_line = ""
     if feed.is_running:
+        paused_tag = " (ĐANG TẠM DỪNG MÀN HÌNH)" if st.session_state.get("pause_live_view", False) else ""
         status_line += (
             f"<div class='live-indicator'><div class='pulse-dot'></div> "
-            f"LIVE TRONG PHIÊN: {len(rt_ticks)} mã nhận tick • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
+            f"LIVE TRONG PHIÊN{paused_tag}: {len(rt_ticks)} mã nhận tick • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
         )
 
     if latest_pct >= 50:
@@ -624,6 +625,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
     hose_pad = max((hose_max - hose_min) * 0.15, 50)
 
     fig.update_layout(
+        uirevision="hose_market_chart",
         hovermode="x unified",
         hoverlabel=dict(bgcolor="rgba(255,255,255,0.96)", font_size=12, font_color="#0f172a", bordercolor="#cbd5e1"),
         legend=dict(
@@ -774,16 +776,31 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                 return f"🔥 {t} — [Chuẩn Minervini | RS: {rs_val}]"
             return f"{t} (RS: {rs_val})"
 
-        col_sel1, col_sel2 = st.columns([2, 1])
+        if 'selected_diag_ticker' not in st.session_state or st.session_state['selected_diag_ticker'] not in ordered_tickers:
+            st.session_state['selected_diag_ticker'] = ordered_tickers[0] if ordered_tickers else None
+
+        col_sel1, col_sel2, col_sel3 = st.columns([2, 1.2, 0.8])
         with col_sel1:
             selected_ticker = st.selectbox(
                 "Chọn hoặc gõ mã cổ phiếu muốn phân tích:",
-                options=ordered_tickers, index=0 if ordered_tickers else None,
+                options=ordered_tickers,
+                key="selected_diag_ticker",
                 format_func=format_ticker_label
             )
         with col_sel2:
-            chart_type = st.radio("Kiểu biểu đồ giá:", ["Biểu đồ Nến (Candlestick)", "Biểu đồ Đường (Close)"],
-                                  horizontal=True)
+            chart_type = st.radio(
+                "Kiểu biểu đồ giá:",
+                ["Biểu đồ Nến (Candlestick)", "Biểu đồ Đường (Close)"],
+                key="diag_chart_type",
+                horizontal=True
+            )
+        with col_sel3:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            st.checkbox(
+                "⏸️ Tạm dừng nhảy số",
+                key="pause_live_view",
+                help="Giữ yên màn hình để gõ mã và soi nến mượt hơn khi đang bật Realtime"
+            )
 
         if selected_ticker:
             tk_data = latest_data[latest_data['Ticker'] == selected_ticker]
@@ -881,6 +898,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                                                    line=dict(color='#0284c7', width=1.5)), row=2, col=1)
 
                     fig_stock.update_layout(
+                        uirevision=selected_ticker,
                         hovermode="x unified", height=540, xaxis_rangeslider_visible=False,
                         margin=dict(l=50, r=20, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -894,7 +912,7 @@ def render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, s
                     st.plotly_chart(fig_stock, use_container_width=True)
 
 
-@st.fragment(run_every="5s")
+@st.fragment(run_every="10s")
 def render_live_fragment(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter):
     render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
 
@@ -975,7 +993,7 @@ def main():
         st.error("⚠️ Không tải được dữ liệu từ API. Vui lòng kiểm tra lại kết nối mạng!")
         return
 
-    if realtime_on:
+    if realtime_on and not st.session_state.get("pause_live_view", False):
         render_live_fragment(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
     else:
         render_dashboard_body(df_raw, df_vnindex, symbols, fetch_start, fetch_end, show_ma20_line, min_vol_filter)
