@@ -314,10 +314,11 @@ def _build_ohlcv_df(data: dict, sym: str, check_vnd_unit: bool = True) -> pd.Dat
     l_arr = data.get("l") or []
     c_arr = data.get("c") or []
     v_arr = data.get("v") or []
-    n = min(len(t_arr), len(o_arr), len(h_arr), len(l_arr), len(c_arr), len(v_arr))
+    n = min(len(t_arr), len(o_arr), len(h_arr), len(l_arr), len(c_arr))
     if n == 0:
         return pd.DataFrame()
 
+    vol_col = pd.to_numeric(v_arr[:n], errors="coerce") if len(v_arr) >= n else 0.0
     vn_dates = pd.to_datetime(pd.Series(t_arr[:n], dtype="int64") + 25200, unit="s").dt.normalize()
     df = pd.DataFrame({
         "Date": vn_dates,
@@ -326,8 +327,9 @@ def _build_ohlcv_df(data: dict, sym: str, check_vnd_unit: bool = True) -> pd.Dat
         "High": pd.to_numeric(h_arr[:n], errors="coerce"),
         "Low": pd.to_numeric(l_arr[:n], errors="coerce"),
         "Close": pd.to_numeric(c_arr[:n], errors="coerce"),
-        "Volume": pd.to_numeric(v_arr[:n], errors="coerce").fillna(0.0)
+        "Volume": vol_col
     })
+    df["Volume"] = df["Volume"].fillna(0.0)
     df.dropna(subset=["Date", "Close"], inplace=True)
     df = df[df["Close"] > 0].copy()
     if df.empty:

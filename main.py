@@ -9,6 +9,11 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
+import ssi_engine
 from ssi_engine import (
     BASKETS,
     get_ssi_basket,
@@ -16,9 +21,20 @@ from ssi_engine import (
     fetch_ssi_basket_history,
     fetch_ssi_symbol_history,
     get_vn_today,
-    is_valid_vn_ticker,
-    reset_ssi_circuit_breaker,
     feed
+)
+
+is_valid_vn_ticker = getattr(
+    ssi_engine,
+    "is_valid_vn_ticker",
+    lambda sym: len(str(sym or "").strip()) == 3
+    and str(sym or "").strip().isalnum()
+    and str(sym or "").strip()[0].isalpha(),
+)
+reset_ssi_circuit_breaker = getattr(
+    ssi_engine,
+    "reset_ssi_circuit_breaker",
+    lambda: None,
 )
 
 if __name__ == '__main__' and not exists():
