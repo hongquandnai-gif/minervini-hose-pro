@@ -27,20 +27,67 @@ def is_vn_market_hours() -> bool:
     return datetime.time(8, 45) <= t <= datetime.time(15, 15)
 
 
-# Tái sử dụng kết nối TCP/TLS giúp tải dữ liệu nhanh gấp 3-5 lần
-HTTP_SESSION = requests.Session()
-_adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=1)
-HTTP_SESSION.mount("https://", _adapter)
-HTTP_SESSION.mount("http://", _adapter)
-HTTP_SESSION.headers.update({
+# Mỗi thread dùng riêng 1 requests.Session (an toàn đa luồng + tái sử dụng TCP/TLS)
+_THREAD_LOCAL = threading.local()
+
+BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
+}
 
 SSI_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Origin": "https://iboard.ssi.com.vn",
     "Referer": "https://iboard.ssi.com.vn/",
 }
+
+# Circuit breaker: tránh lãng phí hàng trăm request khi IP server bị SSI chặn tạm thời (403/timeout)
+_SSI_CB_LOCK = threading.Lock()
+_SSI_CHART_FAIL_STREAK = 0
+_SSI_CHART_BLOCKED_UNTIL = 0.0
+_SSI_IBOARD_BLOCKED_UNTIL = 0.0
+
+
+def reset_ssi_circuit_breaker():
+    global _SSI_CHART_FAIL_STREAK, _SSI_CHART_BLOCKED_UNTIL, _SSI_IBOARD_BLOCKED_UNTIL
+    with _SSI_CB_LOCK:
+        _SSI_CHART_FAIL_STREAK = 0
+        _SSI_CHART_BLOCKED_UNTIL = 0.0
+        _SSI_IBOARD_BLOCKED_UNTIL = 0.0
+
+
+def _get_http_session() -> requests.Session:
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=1)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        sess.headers.update(BASE_HEADERS)
+        _THREAD_LOCAL.session = sess
+    return sess
+
+
+def is_valid_vn_ticker(sym: str) -> bool:
+    """Mã cổ phiếu VN chuẩn gồm 3 ký tự chữ/số và bắt đầu bằng chữ cái (bao gồm PC1, NT2, HT1, C32, D2D...)."""
+    s = str(sym or "").strip().upper()
+    return len(s) == 3 and s.isalnum() and s[0].isalpha()
+
+
+def _is_raw_vnd_series(close_series: pd.Series) -> bool:
+    """Phân biệt đơn vị VND gốc (VD: 26500) với Nghìn đồng (VD: 26.5 hoặc VNZ 450.0)."""
+    valid = close_series.dropna()
+    valid = valid[valid > 0]
+    if valid.empty:
+        return False
+    med = float(valid.median())
+    if med >= 2000:
+        return True
+    if med >= 300:
+        # Nếu là đơn vị VND gốc thì giá luôn là số nguyên chia hết cho 10 (bước giá 10/50/100đ)
+        is_int = ((valid % 1).abs() < 1e-6).mean() > 0.95
+        is_mult10 = ((valid % 10).abs() < 1e-6).mean() > 0.90
+        return bool(is_int and is_mult10)
+    return False
 
 # Tên các bảng/rổ giữ đúng tên gốc trên bảng giá SSI iBoard
 BASKETS = {
@@ -88,6 +135,19 @@ HOSE_FULL_FALLBACK = [
 ]
 
 
+VN30_FALLBACK = [
+    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
+    "LPB", "MBB", "MSN", "MWG", "PLX", "SAB", "SHB", "SSB", "SSI", "STB",
+    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE"
+]
+
+HNX30_FALLBACK = [
+    "BVS", "CAP", "CEO", "DHT", "DP3", "DTD", "DVM", "DXP", "HGM", "HUT",
+    "IDC", "IDV", "L14", "L18", "LAS", "LHC", "MBS", "NTP", "NVB", "PLC",
+    "PSD", "PVB", "PVC", "PVI", "PVS", "SHS", "SLS", "TMB", "TNG", "VC3"
+]
+
+
 def _extract_ssi_items(items: list) -> dict:
     """Trích xuất mã cổ phiếu và tên doanh nghiệp gốc từ JSON SSI iBoard, giữ nguyên thứ tự gốc của SSI."""
     stock_map = {}
@@ -95,7 +155,7 @@ def _extract_ssi_items(items: list) -> dict:
         if not isinstance(item, dict):
             continue
         sym = str(item.get("stockSymbol") or item.get("sym") or item.get("code") or "").strip().upper()
-        if len(sym) != 3 or not sym.isalpha():
+        if not is_valid_vn_ticker(sym):
             continue
 
         # Lọc đúng cổ phiếu thường theo stockType của SSI (bỏ ETF, CW, trái phiếu nếu có)
@@ -117,13 +177,21 @@ def _extract_ssi_items(items: list) -> dict:
 
 
 def _fetch_ssi_endpoint(url: str) -> dict:
+    global _SSI_IBOARD_BLOCKED_UNTIL
+    now = time.time()
+    with _SSI_CB_LOCK:
+        if now < _SSI_IBOARD_BLOCKED_UNTIL:
+            return {}
     try:
-        resp = HTTP_SESSION.get(url, headers=SSI_HEADERS, timeout=7)
+        resp = _get_http_session().get(url, headers=SSI_HEADERS, timeout=7)
         if resp.status_code == 200:
             payload = resp.json()
-            items = payload.get("data", [])
+            items = payload.get("data", []) if isinstance(payload, dict) else []
             if isinstance(items, list) and items:
                 return _extract_ssi_items(items)
+        elif resp.status_code in (401, 403, 429):
+            with _SSI_CB_LOCK:
+                _SSI_IBOARD_BLOCKED_UNTIL = time.time() + 180
     except Exception:
         pass
     return {}
@@ -132,13 +200,13 @@ def _fetch_ssi_endpoint(url: str) -> dict:
 def _fetch_vnd_fallback(floors: str) -> dict:
     try:
         url = f"https://finfo-api.vndirect.com.vn/v4/stocks?q=type:stock~status:listed~floor:{floors}&size=3000"
-        resp = HTTP_SESSION.get(url, timeout=8)
+        resp = _get_http_session().get(url, timeout=8)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             res = {}
             for item in data:
                 code = str(item.get("code") or "").strip().upper()
-                if len(code) == 3 and code.isalpha():
+                if is_valid_vn_ticker(code):
                     res[code] = str(item.get("companyName") or item.get("shortName") or "").strip()
             return res
     except Exception:
@@ -172,8 +240,8 @@ def get_ssi_basket(basket_label: str):
     # 1. Rổ lấy trực tiếp từ luồng WebSocket SSI
     if source_type == "ws":
         ws_map = feed.discover_ws_symbols(wait_seconds=3.5)
-        master_names = get_ssi_master_names()
         if ws_map:
+            master_names = get_ssi_master_names()
             enriched = {
                 sym: (name or master_names.get(sym, ""))
                 for sym, name in ws_map.items()
@@ -184,6 +252,9 @@ def get_ssi_basket(basket_label: str):
         hose_map = _fetch_ssi_endpoint("https://iboard-query.ssi.com.vn/stock/exchange/hose?boardId=MAIN")
         if hose_map:
             return list(hose_map.keys()), hose_map, "WebSocket ngoài giờ → Tự đồng bộ bảng HOSE gốc SSI"
+        vnd_hose = _fetch_vnd_fallback("HOSE")
+        if vnd_hose:
+            return list(vnd_hose.keys()), vnd_hose, "WebSocket ngoài giờ → Dự phòng bảng HOSE (VNDirect)"
         return list(HOSE_FULL_FALLBACK), {s: "" for s in HOSE_FULL_FALLBACK}, "Dự phòng cục bộ (WebSocket & SSI không phản hồi)"
 
     # 2. Lấy theo sàn / rổ gốc của SSI iBoard
@@ -216,67 +287,117 @@ def get_ssi_basket(basket_label: str):
                 source_info += f" + {added} mã WebSocket"
         return list(stock_map.keys()), stock_map, source_info
 
-    # 3. Fallback nếu IP Streamlit Cloud bị tường lửa SSI chặn tạm thời
+    # 3. Fallback nếu IP Cloud bị tường lửa SSI chặn tạm thời
+    if code == "VN30":
+        vnd_names = _fetch_vnd_fallback("HOSE")
+        vn30_map = {s: vnd_names.get(s, "") for s in VN30_FALLBACK}
+        return list(vn30_map.keys()), vn30_map, "Dự phòng rổ VN30 (SSI iBoard tạm không phản hồi)"
+    if code == "HNX30":
+        vnd_names = _fetch_vnd_fallback("HNX")
+        hnx30_map = {s: vnd_names.get(s, "") for s in HNX30_FALLBACK}
+        return list(hnx30_map.keys()), hnx30_map, "Dự phòng rổ HNX30 (SSI iBoard tạm không phản hồi)"
+
     floor_map = {"hose": "HOSE", "hnx": "HNX", "upcom": "UPCOM", "ALL": "HOSE,HNX,UPCOM"}
     vnd_floor = floor_map.get(code, "HOSE")
     vnd_map = _fetch_vnd_fallback(vnd_floor)
     if vnd_map:
-        return list(vnd_map.keys()), vnd_map, f"Dự phòng VNDirect (SSI iBoard tạm không phản hồi)"
+        note = f"sàn {vnd_floor}" if code not in floor_map else code.upper()
+        return list(vnd_map.keys()), vnd_map, f"Dự phòng VNDirect ({note} — SSI iBoard tạm không phản hồi)"
 
     return list(HOSE_FULL_FALLBACK), {s: "" for s in HOSE_FULL_FALLBACK}, "Dự phòng danh sách HOSE cục bộ"
 
 
+def _build_ohlcv_df(data: dict, sym: str, check_vnd_unit: bool = True) -> pd.DataFrame:
+    t_arr = data.get("t") or []
+    o_arr = data.get("o") or []
+    h_arr = data.get("h") or []
+    l_arr = data.get("l") or []
+    c_arr = data.get("c") or []
+    v_arr = data.get("v") or []
+    n = min(len(t_arr), len(o_arr), len(h_arr), len(l_arr), len(c_arr), len(v_arr))
+    if n == 0:
+        return pd.DataFrame()
+
+    vn_dates = pd.to_datetime(pd.Series(t_arr[:n], dtype="int64") + 25200, unit="s").dt.normalize()
+    df = pd.DataFrame({
+        "Date": vn_dates,
+        "Ticker": sym,
+        "Open": pd.to_numeric(o_arr[:n], errors="coerce"),
+        "High": pd.to_numeric(h_arr[:n], errors="coerce"),
+        "Low": pd.to_numeric(l_arr[:n], errors="coerce"),
+        "Close": pd.to_numeric(c_arr[:n], errors="coerce"),
+        "Volume": pd.to_numeric(v_arr[:n], errors="coerce").fillna(0.0)
+    })
+    df.dropna(subset=["Date", "Close"], inplace=True)
+    df = df[df["Close"] > 0].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Bù Open/High/Low nếu bị thiếu hoặc <= 0
+    df["Open"] = df["Open"].where(df["Open"] > 0, df["Close"])
+    df["High"] = df["High"].where(df["High"] > 0, df[["Open", "Close"]].max(axis=1))
+    df["Low"] = df["Low"].where(df["Low"] > 0, df[["Open", "Close"]].min(axis=1))
+
+    if check_vnd_unit and sym != "VNINDEX" and _is_raw_vnd_series(df["Close"]):
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = df[col] / 1000.0
+
+    df.sort_values(by="Date", inplace=True)
+    df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
 def fetch_ssi_symbol_history(symbol: str, start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
     """Tải lịch sử OHLCV chuẩn hóa múi giờ Việt Nam (UTC+7) và đơn vị Nghìn đồng"""
+    global _SSI_CHART_FAIL_STREAK, _SSI_CHART_BLOCKED_UNTIL
     sym = symbol.upper()
-    buffer_start = start_date - datetime.timedelta(days=330)
+    # Đệm 400 ngày lịch (~265 phiên giao dịch) để đủ tính MA200, MA200_20D_ago, 52W High/Low và Momentum 252 phiên
+    buffer_start = start_date - datetime.timedelta(days=400)
     from_ts = int(datetime.datetime.combine(buffer_start, datetime.time.min, tzinfo=VN_TZ).timestamp())
     to_ts = int(datetime.datetime.combine(end_date, datetime.time.max, tzinfo=VN_TZ).timestamp())
+    sess = _get_http_session()
 
-    # Ưu tiên SSI Chart API trước, fallback sang VNDirect Chart API
-    ssi_sym = "VN-INDEX" if sym == "VNINDEX" else sym
-    ssi_url = f"https://iboard-api.ssi.com.vn/statistics/charts/history?resolution=1D&symbol={ssi_sym}&from={from_ts}&to={to_ts}"
-    try:
-        resp = HTTP_SESSION.get(ssi_url, headers=SSI_HEADERS, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json().get("data", resp.json())
-            if isinstance(data, dict) and data.get("s") == "ok" and data.get("t"):
-                vn_dates = pd.to_datetime(pd.Series(data["t"], dtype="int64") + 25200, unit="s").dt.normalize()
-                df = pd.DataFrame({
-                    "Date": vn_dates,
-                    "Ticker": sym,
-                    "Open": pd.to_numeric(data["o"], errors="coerce"),
-                    "High": pd.to_numeric(data["h"], errors="coerce"),
-                    "Low": pd.to_numeric(data["l"], errors="coerce"),
-                    "Close": pd.to_numeric(data["c"], errors="coerce"),
-                    "Volume": pd.to_numeric(data["v"], errors="coerce")
-                })
-                if sym != "VNINDEX" and df["Close"].median() > 300:
-                    for col in ["Open", "High", "Low", "Close"]:
-                        df[col] = df[col] / 1000.0
-                df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-                return df
-    except Exception:
-        pass
+    # Ưu tiên SSI Chart API trước (có circuit breaker nếu bị chặn), fallback sang VNDirect Chart API
+    skip_ssi = False
+    with _SSI_CB_LOCK:
+        if time.time() < _SSI_CHART_BLOCKED_UNTIL:
+            skip_ssi = True
+
+    if not skip_ssi:
+        ssi_sym = "VN-INDEX" if sym == "VNINDEX" else sym
+        ssi_url = f"https://iboard-api.ssi.com.vn/statistics/charts/history?resolution=1D&symbol={ssi_sym}&from={from_ts}&to={to_ts}"
+        try:
+            resp = sess.get(ssi_url, headers=SSI_HEADERS, timeout=6)
+            if resp.status_code == 200:
+                raw_json = resp.json()
+                data = raw_json.get("data", raw_json) if isinstance(raw_json, dict) else {}
+                if isinstance(data, dict) and data.get("s") == "ok" and data.get("t"):
+                    with _SSI_CB_LOCK:
+                        _SSI_CHART_FAIL_STREAK = 0
+                    df = _build_ohlcv_df(data, sym, check_vnd_unit=True)
+                    if not df.empty:
+                        return df
+            elif resp.status_code in (401, 403, 429):
+                with _SSI_CB_LOCK:
+                    _SSI_CHART_FAIL_STREAK += 1
+                    if _SSI_CHART_FAIL_STREAK >= 3:
+                        _SSI_CHART_BLOCKED_UNTIL = time.time() + 300
+        except Exception:
+            with _SSI_CB_LOCK:
+                _SSI_CHART_FAIL_STREAK += 1
+                if _SSI_CHART_FAIL_STREAK >= 8:
+                    _SSI_CHART_BLOCKED_UNTIL = time.time() + 180
 
     vnd_url = f"https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol={sym}&from={from_ts}&to={to_ts}"
     try:
-        resp = HTTP_SESSION.get(vnd_url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=6)
+        resp = sess.get(vnd_url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("s") == "ok" and data.get("t"):
-                vn_dates = pd.to_datetime(pd.Series(data["t"], dtype="int64") + 25200, unit="s").dt.normalize()
-                df = pd.DataFrame({
-                    "Date": vn_dates,
-                    "Ticker": sym,
-                    "Open": pd.to_numeric(data["o"], errors="coerce"),
-                    "High": pd.to_numeric(data["h"], errors="coerce"),
-                    "Low": pd.to_numeric(data["l"], errors="coerce"),
-                    "Close": pd.to_numeric(data["c"], errors="coerce"),
-                    "Volume": pd.to_numeric(data["v"], errors="coerce")
-                })
-                df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-                return df
+            if isinstance(data, dict) and data.get("s") == "ok" and data.get("t"):
+                df = _build_ohlcv_df(data, sym, check_vnd_unit=True)
+                if not df.empty:
+                    return df
     except Exception:
         pass
 
@@ -332,23 +453,26 @@ class SSIRealtimeFeed:
                 cls._instance.source_name = "Đang khởi tạo..."
                 cls._instance.last_sync_str = "--:--:--"
                 cls._instance.data_lock = threading.Lock()
+                cls._instance._stop_event = threading.Event()
         return cls._instance
 
     def set_symbols(self, symbols: list, basket_label: str = "HOSE"):
-        if symbols:
-            self.active_symbols = list(dict.fromkeys(symbols))
         if basket_label in ("HNX", "HNX30"):
-            self.active_exchanges = ["hnx"]
+            exchanges = ["hnx"]
         elif basket_label == "UPCOM":
-            self.active_exchanges = ["upcom"]
+            exchanges = ["upcom"]
         elif "HNX" in basket_label or "WS" in basket_label or "WebSocket" in basket_label:
-            self.active_exchanges = ["hose", "hnx", "upcom"]
+            exchanges = ["hose", "hnx", "upcom"]
         else:
-            self.active_exchanges = ["hose"]
+            exchanges = ["hose"]
+        with self.data_lock:
+            if symbols:
+                self.active_symbols = list(dict.fromkeys(symbols))
+            self.active_exchanges = exchanges
 
     def _record_ws_symbol(self, ticker: str, company_name: str = ""):
         ticker = str(ticker).strip().upper()
-        if len(ticker) == 3 and ticker.isalpha():
+        if is_valid_vn_ticker(ticker):
             with self.data_lock:
                 if ticker not in self.ws_discovered_symbols or (company_name and not self.ws_discovered_symbols[ticker]):
                     self.ws_discovered_symbols[ticker] = company_name
@@ -373,7 +497,10 @@ class SSIRealtimeFeed:
                 break
             time.sleep(0.25)
 
-        return self.get_ws_discovered_symbols()
+        result = self.get_ws_discovered_symbols()
+        if not was_running:
+            self.stop()
+        return result
 
     def _normalize_and_store(
             self,
@@ -391,6 +518,8 @@ class SSIRealtimeFeed:
         ticker = str(ticker).strip().upper()
         if ticker in ["VN-INDEX", "VNINDEX", "10"]:
             ticker = "VNINDEX"
+        elif not is_valid_vn_ticker(ticker):
+            return
 
         if ticker != "VNINDEX" and is_vnd_unit:
             price = price / 1000.0
@@ -417,20 +546,28 @@ class SSIRealtimeFeed:
             }
 
     def _poll_ssi_iboard_snapshot(self) -> int:
+        with self.data_lock:
+            exchanges = list(self.active_exchanges)
         urls = [
             f"https://iboard-query.ssi.com.vn/stock/exchange/{ex}?boardId=MAIN"
-            for ex in self.active_exchanges
+            for ex in exchanges
         ]
+        sess = _get_http_session()
         count = 0
         for url in urls:
+            if not self.is_running:
+                break
             try:
-                resp = HTTP_SESSION.get(url, headers=SSI_HEADERS, timeout=4)
+                resp = sess.get(url, headers=SSI_HEADERS, timeout=4)
                 if resp.status_code == 200:
-                    items = resp.json().get("data", [])
+                    payload = resp.json()
+                    items = payload.get("data", []) if isinstance(payload, dict) else []
                     if isinstance(items, list) and len(items) > 0:
                         for item in items:
+                            if not isinstance(item, dict):
+                                continue
                             sym = item.get("stockSymbol") or item.get("sym") or item.get("code")
-                            if not sym:
+                            if not sym or not is_valid_vn_ticker(sym):
                                 continue
 
                             matched_price = float(item.get("matchedPrice") or item.get("lastPrice") or 0)
@@ -468,18 +605,21 @@ class SSIRealtimeFeed:
         from_ts = to_ts - (7 * 86400)
         url = f"https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol={sym}&from={from_ts}&to={to_ts}"
         try:
-            r = HTTP_SESSION.get(url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=4)
+            r = _get_http_session().get(url, headers={"Referer": "https://dchart.vndirect.com.vn/"}, timeout=4)
             if r.status_code == 200:
                 d = r.json()
-                if d.get("s") == "ok" and d.get("t"):
+                if isinstance(d, dict) and d.get("s") == "ok" and d.get("t") and d.get("c"):
+                    price = float(d["c"][-1])
+                    if price <= 0:
+                        return False
                     last_dt = pd.to_datetime(int(d["t"][-1]) + 25200, unit="s").normalize()
                     self._normalize_and_store(
                         ticker=sym,
-                        price=float(d["c"][-1]),
-                        vol=float(d["v"][-1]),
-                        high=float(d["h"][-1]),
-                        low=float(d["l"][-1]),
-                        open_p=float(d["o"][-1]),
+                        price=price,
+                        vol=float(d["v"][-1]) if d.get("v") else 0.0,
+                        high=float(d["h"][-1]) if d.get("h") else price,
+                        low=float(d["l"][-1]) if d.get("l") else price,
+                        open_p=float(d["o"][-1]) if d.get("o") else price,
                         date_obj=last_dt,
                         is_vnd_unit=False
                     )
@@ -489,32 +629,35 @@ class SSIRealtimeFeed:
         return False
 
     def _poll_vnd_intraday_batch(self) -> int:
-        targets = ["VNINDEX"] + self.active_symbols
+        with self.data_lock:
+            targets = ["VNINDEX"] + list(self.active_symbols)
         updated = 0
         with ThreadPoolExecutor(max_workers=20) as ex:
             futures = [ex.submit(self._fetch_single_intraday_vnd, s) for s in targets]
             for f in as_completed(futures):
+                if not self.is_running:
+                    break
                 if f.result():
                     updated += 1
         return updated
 
     def _run_polling_worker(self):
-        while self.is_running:
+        while self.is_running and not self._stop_event.is_set():
             try:
                 self._fetch_single_intraday_vnd("VNINDEX")
                 ssi_cnt = self._poll_ssi_iboard_snapshot()
                 if ssi_cnt > 10:
                     self.source_name = "SSI iBoard Live Stream"
                     self.last_sync_str = get_vn_now().strftime("%H:%M:%S")
-                    time.sleep(3)
+                    self._stop_event.wait(3)
                 else:
                     vnd_cnt = self._poll_vnd_intraday_batch()
                     if vnd_cnt > 0:
                         self.source_name = "Intraday Realtime (SSI/VND Hybrid)"
                         self.last_sync_str = get_vn_now().strftime("%H:%M:%S")
-                    time.sleep(5)
+                    self._stop_event.wait(5)
             except Exception:
-                time.sleep(3)
+                self._stop_event.wait(3)
 
     def on_message(self, ws, message):
         try:
@@ -525,8 +668,11 @@ class SSIRealtimeFeed:
             if isinstance(message, str) and message.startswith("S#"):
                 parts = message.split("|")
                 if parts:
-                    raw_sym = parts[0].replace("S#", "").strip().upper()
-                    self._record_ws_symbol(raw_sym)
+                    candidate = parts[0].replace("S#", "").strip().upper()
+                    if is_valid_vn_ticker(candidate):
+                        self._record_ws_symbol(candidate)
+                    elif len(parts) > 1 and is_valid_vn_ticker(parts[1]):
+                        self._record_ws_symbol(parts[1])
                 return
 
             data = json.loads(message)
@@ -573,7 +719,7 @@ class SSIRealtimeFeed:
             "Origin: https://iboard.ssi.com.vn",
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         ]
-        while self.is_running:
+        while self.is_running and not self._stop_event.is_set():
             try:
                 self.ws = websocket.WebSocketApp(
                     ws_url,
@@ -584,13 +730,14 @@ class SSIRealtimeFeed:
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception:
                 pass
-            time.sleep(5)
+            self._stop_event.wait(5)
 
     def start(self, symbols=None, basket_label: str = "HOSE"):
         if symbols:
             self.set_symbols(symbols, basket_label=basket_label)
         with self._lock:
             if not self.is_running:
+                self._stop_event.clear()
                 self.is_running = True
                 if self.poll_thread is None or not self.poll_thread.is_alive():
                     self.poll_thread = threading.Thread(target=self._run_polling_worker, daemon=True)
@@ -602,6 +749,7 @@ class SSIRealtimeFeed:
     def stop(self):
         with self._lock:
             self.is_running = False
+            self._stop_event.set()
             if self.ws:
                 try:
                     self.ws.close()

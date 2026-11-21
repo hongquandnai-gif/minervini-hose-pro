@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import datetime
 import streamlit as st
@@ -15,6 +16,8 @@ from ssi_engine import (
     fetch_ssi_basket_history,
     fetch_ssi_symbol_history,
     get_vn_today,
+    is_valid_vn_ticker,
+    reset_ssi_circuit_breaker,
     feed
 )
 
@@ -35,7 +38,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+    html, body, .stApp { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
 
     .block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 96% !important; }
 
@@ -59,7 +62,11 @@ st.markdown("""
         border-radius: 12px;
         padding: 15px 18px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+        min-height: 118px;
         height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
         transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
     .metric-card:hover {
@@ -69,32 +76,52 @@ st.markdown("""
     }
     .metric-title { font-size: 0.72rem; color: #64748b; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.3px;}
     .metric-value { font-size: 1.6rem; font-weight: 800; color: #0f172a; line-height: 1.1; margin-bottom: 8px;}
-    .metric-delta { font-size: 0.73rem; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;}
+    .metric-delta { font-size: 0.73rem; font-weight: 600; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;}
+
+    .diag-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 14px 18px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        min-height: 138px;
+        height: 100%;
+    }
+    .diag-card-title { font-size: 0.84rem; font-weight: 800; color: #0f172a; margin-bottom: 10px; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
+    .diag-row { font-size: 0.84rem; color: #334155; margin-bottom: 6px; line-height: 1.45; }
 
     .badge-up { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 6px; font-weight: 700; }
     .badge-down { background: #fee2e2; color: #b91c1c; padding: 2px 8px; border-radius: 6px; font-weight: 700; }
     .badge-neutral { background: #f1f5f9; color: #475569; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
 
-    .chart-box {
+    [data-testid="stVerticalBlockBorderWrapper"] {
         background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 16px 20px 8px 20px;
-        margin-top: 16px;
-        margin-bottom: 20px;
+        border: 1px solid #e2e8f0 !important;
+        border-radius: 14px !important;
+        padding: 14px 18px 8px 18px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.02);
     }
+
     .chart-header {
         display: flex;
         justify-content: space-between;
         align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
         border-bottom: 1px solid #f1f5f9;
         padding-bottom: 10px;
-        margin-bottom: 8px;
+        margin-bottom: 6px;
     }
     .chart-title { font-size: 1rem; font-weight: 800; color: #0f172a; display: flex; align-items: center; gap: 8px; }
     .chart-subtitle { font-size: 0.78rem; color: #64748b; font-weight: 500; }
 
+    .status-strip {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 14px;
+    }
     .health-bar {
         display: inline-flex;
         align-items: center;
@@ -104,7 +131,6 @@ st.markdown("""
         border-radius: 50px;
         font-weight: 700;
         font-size: 0.82rem;
-        margin-bottom: 14px;
     }
     .health-bullish { background-color: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
     .health-bearish { background-color: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
@@ -118,11 +144,9 @@ st.markdown("""
         font-weight: 700;
         color: #047857;
         background: #ecfdf5;
-        padding: 6px 14px;
+        padding: 7px 14px;
         border-radius: 20px;
         border: 1px solid #6ee7b7;
-        margin-bottom: 14px;
-        margin-right: 10px;
     }
     .pulse-dot {
         width: 8px; height: 8px; background-color: #10b981; border-radius: 50%;
@@ -138,14 +162,14 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] { padding: 8px 18px; border-radius: 8px; font-weight: 700; font-size: 0.85rem; }
     .stTabs [aria-selected="true"] { background-color: white !important; box-shadow: 0 1px 3px rgba(0,0,0,0.08); color: #0284c7 !important; }
 
-    header { background: transparent !important; }
-    .stApp > header { background-color: transparent !important; }
+    header[data-testid="stHeader"] { background: transparent !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # --- 2. HÀM TÍNH CHỈ BÁO & CACHE NỀN ---
 def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(by=['Ticker', 'Date']).reset_index(drop=True)
     grouped = df.groupby('Ticker', sort=False)
     for ma in [20, 50, 150, 200]:
         df[f'MA{ma}'] = grouped['Close'].rolling(ma).mean().reset_index(level=0, drop=True)
@@ -158,9 +182,9 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Bottom_52W'] = grouped['Low'].rolling(252, min_periods=60).min().reset_index(level=0, drop=True)
 
     c = df['Close']
-    c_63 = grouped['Close'].shift(63)
-    c_126 = grouped['Close'].shift(126)
-    c_252 = grouped['Close'].shift(252)
+    c_63 = grouped['Close'].shift(63).replace(0, np.nan)
+    c_126 = grouped['Close'].shift(126).replace(0, np.nan)
+    c_252 = grouped['Close'].shift(252).replace(0, np.nan)
 
     r_63 = (c / c_63 - 1)
     r_126 = (c / c_126 - 1)
@@ -232,12 +256,12 @@ def cached_market_base(symbols_tuple: tuple, start_d: datetime.date, end_d: date
     return df_raw, df_vnindex, daily_base, df_hist_base
 
 
-# --- 3. CẬP NHẬT REALTIME TỐC ĐỘ CAO (LÁT CẮT 265 PHIÊN CUỐI) ---
+# --- 3. CẬP NHẬT REALTIME TỐC ĐỘ CAO (LÁT CẮT 280 PHIÊN CUỐI + GHÉP LỊCH SỬ) ---
 def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=None):
-    if not rt_ticks:
+    if not rt_ticks or df_raw.empty:
         return daily_base, df_hist_base
 
-    df_tail = df_raw.groupby('Ticker', sort=False).tail(265).copy().reset_index(drop=True)
+    df_tail = df_raw.groupby('Ticker', sort=False).tail(280).copy().reset_index(drop=True)
     max_market_date = df_tail['Date'].max()
     vn_today_ts = pd.Timestamp(get_vn_today())
 
@@ -295,7 +319,8 @@ def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=
             elif tick_date == last_date:
                 df_tail.at[idx, 'Close'] = round(t_price, 2)
                 df_tail.at[idx, 'High'] = round(max(df_tail.at[idx, 'High'], t_high), 2)
-                df_tail.at[idx, 'Low'] = round(min(df_tail.at[idx, 'Low'], t_low), 2)
+                existing_low = float(df_tail.at[idx, 'Low'])
+                df_tail.at[idx, 'Low'] = round(min(existing_low, t_low) if existing_low > 0 else t_low, 2)
                 if t_vol > 0:
                     df_tail.at[idx, 'Volume'] = max(df_tail.at[idx, 'Volume'], t_vol)
                 updated_any = True
@@ -305,14 +330,40 @@ def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=
 
     if new_rows:
         df_tail = pd.concat([df_tail, pd.DataFrame(new_rows)], ignore_index=True)
-        df_tail.sort_values(by=['Ticker', 'Date'], inplace=True)
-        df_tail.reset_index(drop=True, inplace=True)
 
     df_tail = _compute_indicators(df_tail)
 
+    # Giữ trọn lịch sử đầy đủ từ df_hist_base và chỉ thay thế phần từ last_base_date trở đi
+    # giúp đồ thị 160 phiên ở Tab 3 không bị mất đường MA200/MA150 khi bật Realtime
     last_base_date = daily_base['Date'].max()
     recent_slice = df_tail[df_tail['Date'] >= last_base_date]
-    daily_recent = _aggregate_daily_breadth(recent_slice)
+
+    df_hist_merged = pd.concat(
+        [df_hist_base[df_hist_base['Date'] < last_base_date], recent_slice],
+        ignore_index=True
+    )
+
+    # Tính độ rộng cho ngày cuối/ngày mới: với ngày intraday mới, mang theo trạng thái gần nhất của các mã chưa khớp lệnh để độ rộng không bị nhảy ảo
+    breadth_frames = [recent_slice[recent_slice['Date'] == last_base_date]]
+    new_dates = sorted(d for d in recent_slice['Date'].unique() if d > last_base_date)
+    for nd in new_dates:
+        nd_rows = recent_slice[recent_slice['Date'] == nd]
+        present_tks = set(nd_rows['Ticker'].unique())
+        fresh_cutoff = nd - pd.Timedelta(days=14)
+        carry_rows = (
+            df_hist_merged[(df_hist_merged['Date'] < nd) & (df_hist_merged['Date'] >= fresh_cutoff) & (~df_hist_merged['Ticker'].isin(present_tks))]
+            .sort_values(['Ticker', 'Date'])
+            .groupby('Ticker', as_index=False)
+            .last()
+        )
+        if not carry_rows.empty:
+            carry_rows = carry_rows.copy()
+            carry_rows['Date'] = nd
+            breadth_frames.append(pd.concat([nd_rows, carry_rows], ignore_index=True))
+        else:
+            breadth_frames.append(nd_rows)
+
+    daily_recent = _aggregate_daily_breadth(pd.concat(breadth_frames, ignore_index=True))
 
     daily_out = daily_base[daily_base['Date'] < last_base_date].copy()
     daily_out = pd.concat([daily_out, daily_recent], ignore_index=True)
@@ -331,7 +382,7 @@ def apply_realtime_delta(df_raw, df_vnindex, daily_base, df_hist_base, rt_ticks=
     else:
         daily_out['hose_index'] = daily_out['avg_price']
 
-    return daily_out, df_tail
+    return daily_out, df_hist_merged
 
 
 # --- 4. BỘ LỌC MINERVINI & VCP ---
@@ -359,36 +410,38 @@ def filter_minervini_stocks(sf, min_rs=60, min_vol=0):
 
 def detect_vcp_pattern(stock_data, current_date, lookback_days=150):
     data = stock_data[(stock_data['Date'] <= current_date) &
-                      (stock_data['Date'] >= (current_date - pd.Timedelta(days=lookback_days)))]
+                      (stock_data['Date'] >= (current_date - pd.Timedelta(days=lookback_days)))].copy()
+    data = data.dropna(subset=['Date', 'Close']).sort_values('Date')
+    data = data[data['Close'] > 0]
     if len(data) < 35:
         return None
 
     closes = data['Close'].values
     dates = data['Date'].values
-    highs = data['High'].values if 'High' in data.columns else closes
-    lows = data['Low'].values if 'Low' in data.columns else closes
-    vols = data['Volume'].values if 'Volume' in data.columns else np.zeros(len(closes))
-    vol_ma50 = data['Vol_MA50'].values if 'Vol_MA50' in data.columns else np.zeros(len(closes))
+    highs = np.where(data['High'].notna() & (data['High'] > 0), data['High'].values, closes) if 'High' in data.columns else closes
+    lows = np.where(data['Low'].notna() & (data['Low'] > 0), data['Low'].values, closes) if 'Low' in data.columns else closes
+    vols = data['Volume'].fillna(0).values if 'Volume' in data.columns else np.zeros(len(closes))
+    vol_ma50 = data['Vol_MA50'].fillna(0).values if 'Vol_MA50' in data.columns else np.zeros(len(closes))
 
     reversal_pct = 0.028
     swings = []
     current_mode = 'peak'
-    extreme_val = highs[0]
+    extreme_val = float(highs[0])
     extreme_date = dates[0]
 
     for i in range(1, len(closes)):
         if current_mode == 'peak':
             if highs[i] >= extreme_val:
-                extreme_val, extreme_date = highs[i], dates[i]
-            elif (extreme_val - lows[i]) / extreme_val >= reversal_pct:
+                extreme_val, extreme_date = float(highs[i]), dates[i]
+            elif extreme_val > 0 and (extreme_val - lows[i]) / extreme_val >= reversal_pct:
                 swings.append(('peak', extreme_date, extreme_val))
-                current_mode, extreme_val, extreme_date = 'valley', lows[i], dates[i]
+                current_mode, extreme_val, extreme_date = 'valley', float(lows[i]), dates[i]
         else:
             if lows[i] <= extreme_val:
-                extreme_val, extreme_date = lows[i], dates[i]
-            elif (highs[i] - extreme_val) / extreme_val >= reversal_pct:
+                extreme_val, extreme_date = float(lows[i]), dates[i]
+            elif extreme_val > 0 and (highs[i] - extreme_val) / extreme_val >= reversal_pct:
                 swings.append(('valley', extreme_date, extreme_val))
-                current_mode, extreme_val, extreme_date = 'peak', highs[i], dates[i]
+                current_mode, extreme_val, extreme_date = 'peak', float(highs[i]), dates[i]
 
     swings.append((current_mode, extreme_date, extreme_val))
 
@@ -408,6 +461,8 @@ def detect_vcp_pattern(stock_data, current_date, lookback_days=150):
     for i in range(len(clean_swings) - 1):
         if clean_swings[i][0] == 'peak' and clean_swings[i + 1][0] == 'valley':
             p_val, v_val = clean_swings[i][2], clean_swings[i + 1][2]
+            if p_val <= 0 or v_val <= 0:
+                continue
             contractions.append({
                 'peak_date': clean_swings[i][1], 'peak_val': p_val,
                 'valley_date': clean_swings[i + 1][1], 'valley_val': v_val,
@@ -417,6 +472,9 @@ def detect_vcp_pattern(stock_data, current_date, lookback_days=150):
     if len(contractions) < 2:
         return None
 
+    last_bar_dt = pd.to_datetime(dates[-1])
+    curr_price = float(closes[-1])
+
     for num_c in [4, 3, 2]:
         if len(contractions) >= num_c:
             cand = contractions[-num_c:]
@@ -425,14 +483,19 @@ def detect_vcp_pattern(stock_data, current_date, lookback_days=150):
             peaks = [c['peak_val'] for c in cand]
 
             base_days = (pd.to_datetime(cand[-1]['valley_date']) - pd.to_datetime(cand[0]['peak_date'])).days
-            if (base_days >= 15 and
+            days_since_last_valley = (last_bar_dt - pd.to_datetime(cand[-1]['valley_date'])).days
+            pivot = cand[-1]['peak_val']
+            last_valley = cand[-1]['valley_val']
+
+            if (pivot > 0 and
+                    base_days >= 15 and
+                    days_since_last_valley <= 35 and
+                    curr_price >= last_valley * 0.98 and
                     all(depths[i] > depths[i + 1] for i in range(len(depths) - 1)) and
                     all(valleys[i] <= valleys[i + 1] * 1.015 for i in range(len(valleys) - 1)) and
                     depths[-1] <= 8.5 and
                     all(p <= peaks[0] * 1.04 for p in peaks)):
 
-                pivot = cand[-1]['peak_val']
-                curr_price = closes[-1]
                 pct_from_pivot = ((curr_price - pivot) / pivot) * 100
                 curr_vol_ratio = (vols[-1] / vol_ma50[-1] * 100) if (len(vol_ma50) > 0 and vol_ma50[-1] > 0) else np.nan
 
@@ -466,18 +529,18 @@ def evaluate_stock_phase(tk):
     close, ma50 = tk['Close'], tk['MA50']
     pct_from_peak, pct_from_bottom = tk['Pct_From_Peak'], tk['Pct_From_Bottom']
 
-    if pd.isna(ma200) or pd.isna(ma50):
+    if pd.isna(ma200) or pd.isna(ma50) or ma200 <= 0:
         return "CHƯA ĐỦ DỮ LIỆU MA200", "#64748b", "Cổ phiếu mới niêm yết hoặc chưa đủ lịch sử 200 phiên giao dịch để phân loại chu kỳ."
 
     if close > ma50 and ma50 > ma200 and close > ma200 and ma200_slope >= 0:
-        if pct_from_bottom >= 25 and pct_from_peak >= -25:
+        if pd.notna(pct_from_bottom) and pd.notna(pct_from_peak) and pct_from_bottom >= 25 and pct_from_peak >= -25:
             return "GIAI ĐOẠN 2 (TĂNG TỐC - UPTREND MẠNH)", "#10b981", "Cổ phiếu đạt chuẩn Stage 2 của Minervini: Cấu trúc xu hướng hoàn hảo, MA dốc lên, sát đỉnh 52 tuần. Ưu tiên điểm MUA theo đà tăng."
         return "GIAI ĐOẠN 2 (ĐANG TRONG XU HƯỚNG TĂNG)", "#059669", "Nằm trên MA50 & MA200 dốc lên. Xu hướng tăng chủ đạo, có thể xuất hiện nhịp tích lũy tự nhiên."
-    if close <= ma50 and close > ma200 and ma50 > ma200 and ma200_slope >= 0.8:
-        return "GIAI ĐOẠN 2 (ĐIỀU CHỈNH LÀNH MẠNH)", "#0284c7", "Cổ phiếu đang kéo ngược về hỗ trợ MA50 trong khi MA200 vẫn dốc mạnh lên. Đây là nhịp tích lũy tự nhiên của Giai đoạn 2."
-    if pct_from_peak >= -25 and abs(ma200_slope) < 0.6 and (close < ma50 or close < ma200):
+    if close <= ma50 and close > ma200 and ma50 > ma200 and ma200_slope >= 0.3:
+        return "GIAI ĐOẠN 2 (ĐIỀU CHỈNH LÀNH MẠNH)", "#0284c7", "Cổ phiếu đang kéo ngược về hỗ trợ MA50 trong khi MA200 vẫn dốc lên. Đây là nhịp tích lũy tự nhiên của Giai đoạn 2."
+    if pd.notna(pct_from_peak) and pct_from_peak >= -25 and abs(ma200_slope) < 0.6 and (close < ma50 or close < ma200):
         return "GIAI ĐOẠN 3 (PHÂN PHỐI - TẠO ĐỈNH)", "#f59e0b", "MA200 bắt đầu đi ngang, mất đà tăng trưởng. Giá dao động lỏng lẻo quanh MA50/MA200. Cân nhắc chốt lời từng phần."
-    if abs(ma200_slope) <= 0.8 and abs(close - ma200) / ma200 <= 0.12 and pct_from_peak < -25:
+    if abs(ma200_slope) <= 0.8 and abs(close - ma200) / ma200 <= 0.12 and (pd.isna(pct_from_peak) or pct_from_peak < -25):
         return "GIAI ĐOẠN 1 (TÍCH LŨY - TẠO ĐÁY)", "#3b82f6", "Giá dao động biên hẹp quanh đường MA200 đang phẳng ra sau chu kỳ giảm dài."
     if close < ma200 and ma50 < ma200:
         return "GIAI ĐOẠN 4 (SUY THOÁI - DOWNTREND)", "#ef4444", "Cổ phiếu trong xu hướng giảm dài hạn (Stage 4). Giá và MA50 nằm hoàn toàn dưới MA200. TUYỆT ĐỐI KHÔNG BẮT ĐÁY!"
@@ -534,15 +597,37 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
         st.warning("⚠️ Không có dữ liệu để vẽ đồ thị trong khoảng thời gian đã chọn.")
         return
 
-    actual_eval_date = df_history[df_history['Date'] <= end_ts]['Date'].max()
-    latest_data = df_history[df_history['Date'] == actual_eval_date].copy()
-    latest_data['RS_Rating'] = (
-        (latest_data['Momentum'].rank(pct=True, ascending=True, na_option='keep') * 98)
-        .round().fillna(0).astype(int) + 1
+    hist_upto = df_history[df_history['Date'] <= end_ts]
+    if hist_upto.empty:
+        st.warning("⚠️ Không có dữ liệu giao dịch tính đến ngày kết thúc đã chọn.")
+        return
+
+    actual_eval_date = hist_upto['Date'].max()
+    # Lấy phiên giao dịch gần nhất của từng mã (trong vòng 14 ngày gần nhất) để tránh rơi rụng mã chưa khớp lệnh trong phiên live hoặc mã thanh khoản thấp
+    fresh_cutoff = actual_eval_date - pd.Timedelta(days=14)
+    latest_data = (
+        hist_upto[hist_upto['Date'] >= fresh_cutoff]
+        .sort_values(['Ticker', 'Date'])
+        .groupby('Ticker', as_index=False)
+        .last()
+    )
+    rs_rank = latest_data['Momentum'].rank(pct=True, ascending=True, na_option='keep')
+    latest_data['RS_Rating'] = np.where(
+        rs_rank.notna(),
+        (rs_rank * 98).round() + 1,
+        np.nan
     )
 
-    latest_hose = data_plot['hose_index'].iloc[-1]
-    prev_hose = data_plot['hose_index'].iloc[-2] if len(data_plot) > 1 else latest_hose
+    has_vni = not df_vnindex.empty
+    index_label = "Chỉ Số HOSE (VN-INDEX)" if has_vni else "Giá TB Rổ Cổ Phiếu"
+
+    valid_hose = data_plot.dropna(subset=['hose_index'])
+    if valid_hose.empty:
+        st.warning("⚠️ Không có dữ liệu chỉ số trong khoảng thời gian đã chọn.")
+        return
+
+    latest_hose = valid_hose['hose_index'].iloc[-1]
+    prev_hose = valid_hose['hose_index'].iloc[-2] if len(valid_hose) > 1 else latest_hose
 
     latest_pct = data_plot['pct_above_ma'].iloc[-1]
     prev_pct = data_plot['pct_above_ma'].iloc[-2] if len(data_plot) > 1 else latest_pct
@@ -553,14 +638,21 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     latest_bot = data_plot['pct_bottoming'].iloc[-1]
     prev_bot = data_plot['pct_bottoming'].iloc[-2] if len(data_plot) > 1 else latest_bot
 
-    peak_row = data_plot.loc[data_plot['hose_index'].idxmax()]
-    peak_price, peak_date = peak_row['hose_index'], peak_row['Date']
-    pct_drop = ((peak_price - latest_hose) / peak_price) * 100 if peak_price > 0 else 0
+    peak_idx = valid_hose['hose_index'].idxmax()
+    peak_row = valid_hose.loc[peak_idx]
+    peak_price, peak_date = float(peak_row['hose_index']), peak_row['Date']
+    pct_drop = ((peak_price - latest_hose) / peak_price) * 100 if peak_price > 0 else 0.0
 
     cum_peak_historical = data_plot['hose_index'].cummax()
-    data_plot['pct_drop_from_peak'] = ((cum_peak_historical - data_plot['hose_index']) / cum_peak_historical) * 100
+    data_plot['pct_drop_from_peak'] = np.where(
+        cum_peak_historical > 0,
+        ((cum_peak_historical - data_plot['hose_index']) / cum_peak_historical) * 100,
+        0.0
+    )
 
-    if latest_below_ma20 >= 80:
+    if pd.isna(latest_below_ma20):
+        st_short_term = "⚖️ Ngắn hạn: Chưa đủ dữ liệu MA20"
+    elif latest_below_ma20 >= 80:
         st_short_term = f"⚡ Ngắn hạn: QUÁ BÁN CỰC ĐẠI ({latest_below_ma20:.1f}% < MA20) - Dễ hồi kỹ thuật"
     elif latest_below_ma20 <= 20:
         st_short_term = f"🔥 Ngắn hạn: HƯNG PHẤN / QUÁ MUA ({latest_below_ma20:.1f}% < MA20) - Tránh FOMO"
@@ -569,28 +661,31 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     else:
         st_short_term = f"⚖️ Ngắn hạn: Cân bằng ({latest_below_ma20:.1f}% < MA20)"
 
-    status_line = ""
+    status_items = []
     if feed.is_running:
         paused_tag = " (ĐÃ TẠM DỪNG MÀN HÌNH)" if st.session_state.get("pause_live_view", False) else ""
         ws_count = len(feed.get_ws_discovered_symbols())
-        status_line += (
+        status_items.append(
             f"<div class='live-indicator'><div class='pulse-dot'></div> "
             f"LIVE TRONG PHIÊN{paused_tag}: {len(rt_ticks)} mã tick (WSS: {ws_count} mã) • Nguồn: {feed.source_name} • Lúc: {feed.last_sync_str}</div>"
         )
 
-    if latest_pct >= 50:
-        status_line += f"<div class='health-bar health-bullish'>🟢 DÀI HẠN: UPTREND ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>"
-    elif latest_pct <= 20 and latest_bot >= 40:
-        status_line += f"<div class='health-bar health-bearish'>🔴 DÀI HẠN: DÒ ĐÁY NGUY HIỂM ({latest_bot:.1f}% sát đáy 52T) &nbsp;|&nbsp; {st_short_term}</div>"
+    if pd.isna(latest_pct):
+        status_items.append(f"<div class='health-bar health-neutral'>🟡 DÀI HẠN: CHƯA ĐỦ DỮ LIỆU MA200 &nbsp;|&nbsp; {st_short_term}</div>")
+    elif latest_pct >= 50:
+        status_items.append(f"<div class='health-bar health-bullish'>🟢 DÀI HẠN: UPTREND ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>")
+    elif latest_pct <= 20 and pd.notna(latest_bot) and latest_bot >= 40:
+        status_items.append(f"<div class='health-bar health-bearish'>🔴 DÀI HẠN: DÒ ĐÁY NGUY HIỂM ({latest_bot:.1f}% sát đáy 52T) &nbsp;|&nbsp; {st_short_term}</div>")
     elif latest_pct <= 20:
-        status_line += f"<div class='health-bar health-bearish'>🔴 DÀI HẠN: QUÁ BÁN ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>"
+        status_items.append(f"<div class='health-bar health-bearish'>🔴 DÀI HẠN: QUÁ BÁN ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>")
     else:
-        status_line += f"<div class='health-bar health-neutral'>🟡 DÀI HẠN: ĐI NGANG / PHÂN HÓA ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>"
-    st.markdown(status_line, unsafe_allow_html=True)
+        status_items.append(f"<div class='health-bar health-neutral'>🟡 DÀI HẠN: ĐI NGANG / PHÂN HÓA ({latest_pct:.1f}% > MA200) &nbsp;|&nbsp; {st_short_term}</div>")
+
+    st.markdown(f"<div class='status-strip'>{''.join(status_items)}</div>", unsafe_allow_html=True)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        render_metric_card("Chỉ Số HOSE (VN-INDEX)", latest_hose, latest_hose - prev_hose, "so với phiên trước",
+        render_metric_card(index_label, latest_hose, latest_hose - prev_hose, "so với phiên trước",
                            icon="🏛️")
     with c2:
         render_metric_card("Độ Rộng (> MA200)", latest_pct, latest_pct - prev_pct, "so với phiên trước",
@@ -602,102 +697,115 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
         render_metric_card("% CP Dò Đáy (<=10% Đáy)", latest_bot, latest_bot - prev_bot, "so với phiên trước",
                            is_percentage=True, invert_color=True, icon="🕳️")
     with c5:
+        if pct_drop < 0.01:
+            drop_html = '<span style="color:#15803d;">0.00%</span>'
+            drop_badge = f'<span class="badge-up">Đang tại đỉnh ({peak_date.strftime("%d/%m/%Y")})</span>'
+        else:
+            drop_html = f'<span style="color:#ef4444;">-{pct_drop:.2f}%</span>'
+            drop_badge = f'<span class="badge-neutral">Đỉnh: {peak_price:,.2f} ({peak_date.strftime("%d/%m/%Y")})</span>'
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-title">📉 HOSE SỤT GIẢM TỪ ĐỈNH</div>
-            <div class="metric-value"><span style="color:#ef4444;">-{pct_drop:.2f}%</span></div>
-            <div class="metric-delta"><span class="badge-neutral">Đỉnh: {peak_price:,.2f} ({peak_date.strftime('%d/%m/%Y')})</span></div>
+            <div class="metric-value">{drop_html}</div>
+            <div class="metric-delta">{drop_badge}</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div class="chart-box">
+    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(f"""
         <div class="chart-header">
-            <div class="chart-title">📈 Biểu Đồ Tương Quan Chỉ Số HOSE (VN-INDEX) & Độ Rộng Nội Tại ({len(symbols)} Mã)</div>
+            <div class="chart-title">📈 Biểu Đồ Tương Quan {index_label} & Độ Rộng Nội Tại ({len(latest_data)}/{len(symbols)} Mã)</div>
             <div class="chart-subtitle">Dữ liệu từ {fetch_start.strftime('%d/%m/%Y')} đến {actual_eval_date.strftime('%d/%m/%Y')}</div>
         </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    fig.add_trace(go.Scatter(
-        x=data_plot['Date'], y=data_plot['hose_index'], name="Chỉ số HOSE (VN-INDEX)",
-        mode='lines', line=dict(color='#0284c7', width=3.0),
-        customdata=data_plot['pct_drop_from_peak'],
-        hovertemplate="<b>HOSE (VN-INDEX): %{y:,.2f}</b> (Cách đỉnh: -%{customdata:.2f}%)<extra></extra>"
-    ), secondary_y=False)
-
-    fig.add_trace(go.Scatter(
-        x=data_plot['Date'], y=data_plot['pct_above_ma'], name="% Trên MA200 (Dài hạn)",
-        mode='lines', line=dict(color='#f59e0b', width=2.2),
-        hovertemplate="Độ rộng > MA200: <b>%{y:.1f}%</b><extra></extra>"
-    ), secondary_y=True)
-
-    if show_ma20_line:
         fig.add_trace(go.Scatter(
-            x=data_plot['Date'], y=data_plot['pct_below_ma20'], name="% Dưới MA20 (Ngắn hạn)",
-            mode='lines', line=dict(color='rgba(236, 72, 153, 0.55)', width=1.4, dash='dot'),
-            hovertemplate="Áp lực < MA20: <b>%{y:.1f}%</b><extra></extra>"
+            x=data_plot['Date'], y=data_plot['hose_index'], name=index_label,
+            mode='lines', line=dict(color='#0284c7', width=3.0),
+            customdata=data_plot['pct_drop_from_peak'],
+            hovertemplate=f"<b>{index_label}: %{{y:,.2f}}</b> (Cách đỉnh: -%{{customdata:.2f}}%)<extra></extra>"
+        ), secondary_y=False)
+
+        fig.add_trace(go.Scatter(
+            x=data_plot['Date'], y=data_plot['pct_above_ma'], name="% Trên MA200 (Dài hạn)",
+            mode='lines', line=dict(color='#f59e0b', width=2.2),
+            hovertemplate="Độ rộng > MA200: <b>%{y:.1f}%</b><extra></extra>"
         ), secondary_y=True)
 
-    fig.add_trace(go.Scatter(
-        x=data_plot['Date'], y=data_plot['pct_bottoming'], name="% Đang Dò Đáy 52T",
-        mode='lines', line=dict(color='#8b5cf6', width=1.8, dash='dash'),
-        hovertemplate="% Dò đáy 52T: <b>%{y:.1f}%</b><extra></extra>"
-    ), secondary_y=True)
+        if show_ma20_line:
+            fig.add_trace(go.Scatter(
+                x=data_plot['Date'], y=data_plot['pct_below_ma20'], name="% Dưới MA20 (Ngắn hạn)",
+                mode='lines', line=dict(color='rgba(236, 72, 153, 0.55)', width=1.4, dash='dot'),
+                hovertemplate="Áp lực < MA20: <b>%{y:.1f}%</b><extra></extra>"
+            ), secondary_y=True)
 
-    fig.add_trace(go.Scatter(
-        x=[peak_date], y=[peak_price], mode='markers+text',
-        marker=dict(color='#ef4444', size=9, line=dict(color='white', width=2)),
-        text=[f"ĐỈNH: {peak_price:,.2f}"], textposition="top center",
-        textfont=dict(family="Inter", size=11, color="#b91c1c"),
-        showlegend=False, hoverinfo='skip'
-    ), secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=data_plot['Date'], y=data_plot['pct_bottoming'], name="% Đang Dò Đáy 52T",
+            mode='lines', line=dict(color='#8b5cf6', width=1.8, dash='dash'),
+            hovertemplate="% Dò đáy 52T: <b>%{y:.1f}%</b><extra></extra>"
+        ), secondary_y=True)
 
-    fig.add_hline(y=80, line_dash="dot", line_color="rgba(236, 72, 153, 0.5)",
-                  annotation_text="80% (Quá bán ngắn hạn)", annotation_position="top left",
-                  annotation_font=dict(color="#db2777", size=10), secondary_y=True)
-    fig.add_hline(y=50, line_dash="dash", line_color="rgba(148, 163, 184, 0.6)",
-                  annotation_text="50% (Cân bằng)", annotation_position="top left",
-                  annotation_font=dict(color="#64748b", size=10), secondary_y=True)
-    fig.add_hline(y=20, line_dash="dash", line_color="rgba(239, 68, 68, 0.6)",
-                  annotation_text="20% (Hoảng loạn dài hạn)", annotation_position="bottom left",
-                  annotation_font=dict(color="#dc2626", size=10), secondary_y=True)
+        # Tự căn chỉnh nhãn đỉnh tránh bị cắt mép trái/phải
+        date_span = (data_plot['Date'].max() - data_plot['Date'].min()).days
+        peak_rel = ((peak_date - data_plot['Date'].min()).days / date_span) if date_span > 0 else 0.5
+        peak_text_pos = "top left" if peak_rel > 0.85 else ("top right" if peak_rel < 0.15 else "top center")
 
-    hose_min = float(data_plot['hose_index'].min())
-    hose_max = float(data_plot['hose_index'].max())
-    hose_pad = max((hose_max - hose_min) * 0.15, 50)
+        fig.add_trace(go.Scatter(
+            x=[peak_date], y=[peak_price], mode='markers+text',
+            marker=dict(color='#ef4444', size=9, line=dict(color='white', width=2)),
+            text=[f"ĐỈNH: {peak_price:,.2f}"], textposition=peak_text_pos,
+            textfont=dict(family="Inter", size=11, color="#b91c1c"),
+            showlegend=False, hoverinfo='skip'
+        ), secondary_y=False)
 
-    fig.update_layout(
-        uirevision="hose_market_chart",
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor="rgba(255,255,255,0.96)", font_size=12, font_color="#0f172a", bordercolor="#cbd5e1"),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-            font=dict(family="Inter", size=11.5), bgcolor="rgba(255,255,255,0)"
-        ),
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=10, r=10, t=28, b=10), height=450
-    )
+        fig.add_hline(y=80, line_dash="dot", line_color="rgba(236, 72, 153, 0.5)",
+                      annotation_text="80% (Quá bán ngắn hạn)", annotation_position="top left",
+                      annotation_font=dict(color="#db2777", size=10), secondary_y=True)
+        fig.add_hline(y=50, line_dash="dash", line_color="rgba(148, 163, 184, 0.6)",
+                      annotation_text="50% (Cân bằng)", annotation_position="top left",
+                      annotation_font=dict(color="#64748b", size=10), secondary_y=True)
+        fig.add_hline(y=20, line_dash="dash", line_color="rgba(239, 68, 68, 0.6)",
+                      annotation_text="20% (Hoảng loạn dài hạn)", annotation_position="bottom left",
+                      annotation_font=dict(color="#dc2626", size=10), secondary_y=True)
 
-    fig.update_xaxes(
-        showgrid=True, gridcolor='#f1f5f9', linecolor='#cbd5e1',
-        hoverformat="%d/%m/%Y", tickfont=dict(family="Inter", size=11, color="#475569")
-    )
-    fig.update_yaxes(
-        title_text="Chỉ số HOSE (VN-INDEX)", title_font=dict(size=12, color="#0284c7", family="Inter"),
-        range=[hose_min - hose_pad, hose_max + hose_pad * 1.3],
-        showgrid=True, gridcolor='#f1f5f9', tickfont=dict(color="#0284c7", size=11),
-        secondary_y=False
-    )
-    fig.update_yaxes(
-        title_text="Độ Rộng Thị Trường (%)", title_font=dict(size=12, color="#d97706", family="Inter"),
-        range=[0, 105], showgrid=False, tickfont=dict(color="#d97706", size=11),
-        ticksuffix="%", secondary_y=True
-    )
+        hose_min = float(valid_hose['hose_index'].min())
+        hose_max = float(valid_hose['hose_index'].max())
+        hose_pad = max((hose_max - hose_min) * 0.15, hose_max * 0.03, 1.0)
 
-    st.plotly_chart(fig, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        fig.update_layout(
+            uirevision="hose_market_chart",
+            hovermode="x unified",
+            hoverlabel=dict(bgcolor="rgba(255,255,255,0.96)", font_size=12, font_color="#0f172a", bordercolor="#cbd5e1"),
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                font=dict(family="Inter", size=11.5), bgcolor="rgba(255,255,255,0)"
+            ),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=10, r=10, t=42, b=10), height=455
+        )
+
+        fig.update_xaxes(
+            showgrid=True, gridcolor='#f1f5f9', linecolor='#cbd5e1',
+            hoverformat="%d/%m/%Y", tickfont=dict(family="Inter", size=11, color="#475569")
+        )
+        fig.update_yaxes(
+            title_text=index_label, title_font=dict(size=12, color="#0284c7", family="Inter"),
+            range=[max(0, hose_min - hose_pad), hose_max + hose_pad * 1.3],
+            showgrid=True, gridcolor='#f1f5f9', tickfont=dict(color="#0284c7", size=11),
+            secondary_y=False
+        )
+        fig.update_yaxes(
+            title_text="Độ Rộng Thị Trường (%)", title_font=dict(size=12, color="#d97706", family="Inter"),
+            range=[0, 105], showgrid=False, tickfont=dict(color="#d97706", size=11),
+            ticksuffix="%", secondary_y=True
+        )
+
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
     base_stocks = filter_minervini_stocks(latest_data, min_rs=60, min_vol=min_vol_filter)
     vcp_list = []
@@ -735,10 +843,20 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
                         '_abs_dist': abs(res_vcp['pct_from_pivot'])
                     })
 
-    tabs = st.tabs(["🚀 Quét Siêu Cổ Phiếu (Minervini)", "📐 Mẫu Hình Cốc / VCP", "🔍 Chẩn Đoán Cổ Phiếu Đơn & Đồ Thị"])
+        # Sắp xếp VCP theo độ ưu tiên điểm mua -> khoảng cách sát Pivot -> RS Rating (đồng bộ cả Tab 2 & Tab 3)
+        vcp_list.sort(key=lambda x: (x['_priority'], x['_abs_dist'], -x['RS Rating']))
+
+    tabs = st.tabs([
+        f"🚀 Quét Siêu Cổ Phiếu (Minervini)",
+        f"📐 Mẫu Hình Cốc / VCP ({len(vcp_list)})",
+        "🔍 Chẩn Đoán Cổ Phiếu Đơn & Đồ Thị"
+    ])
 
     with tabs[0]:
         st.markdown(f"### 🏆 Bảng Xếp Hạng Cổ Phiếu Dẫn Dắt (Ngày {actual_eval_date.strftime('%d/%m/%Y')})")
+        if len(latest_data) < 10:
+            st.caption("ℹ️ Lưu ý: Điểm RS Rating được xếp hạng tương đối trong phạm vi rổ cổ phiếu đang chọn.")
+
         col_f1, _ = st.columns([1, 3])
         with col_f1:
             rs_threshold = st.slider("Lọc theo RS Rating tối thiểu:", min_value=50, max_value=95, value=70, step=5, key="rs_threshold_slider")
@@ -747,7 +865,7 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
             minervini_stocks = filter_minervini_stocks(latest_data, min_rs=rs_threshold, min_vol=min_vol_filter)
             if not minervini_stocks.empty:
                 st.success(
-                    f"🔥 Phát hiện **{len(minervini_stocks)} / {len(symbols)}** cổ phiếu thỏa mãn Trend Template (RS >= {rs_threshold}, KLGD TB 20P >= {min_vol_filter:,.0f} CP).")
+                    f"🔥 Phát hiện **{len(minervini_stocks)} / {len(latest_data)}** cổ phiếu thỏa mãn Trend Template (RS >= {rs_threshold}, KLGD TB 20P >= {min_vol_filter:,.0f} CP).")
                 disp_df = minervini_stocks[
                     ['Ticker', 'Close', 'RS_Rating', 'Pct_From_Peak', 'Pct_From_Bottom', 'Vol_MA20', 'MA20', 'MA50',
                      'MA150', 'MA200']
@@ -757,15 +875,16 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
                     'Ticker': 'Mã CP', 'Close': 'Giá Hiện Tại', 'Pct_From_Peak': '% Từ Đỉnh 52T',
                     'Pct_From_Bottom': '% Hồi Từ Đáy 52T', 'RS_Rating': 'RS Rating', 'Vol_MA20': 'KLGD TB 20P'
                 })
-                styled_df = disp_df.style \
-                    .map(highlight_rs, subset=['RS Rating']) \
-                    .background_gradient(cmap='OrRd_r', subset=['% Từ Đỉnh 52T']) \
-                    .background_gradient(cmap='Blues', subset=['% Hồi Từ Đáy 52T']) \
-                    .format({
-                        'Giá Hiện Tại': '{:.2f}', 'MA20': '{:.2f}', 'MA50': '{:.2f}', 'MA150': '{:.2f}', 'MA200': '{:.2f}',
-                        '% Từ Đỉnh 52T': '{:.1f}%', '% Hồi Từ Đáy 52T': '{:.1f}%',
-                        'RS Rating': '{:.0f}', 'KLGD TB 20P': '{:,.0f}'
-                    }, na_rep="-")
+                styled_df = disp_df.style.map(highlight_rs, subset=['RS Rating'])
+                if len(disp_df) > 1:
+                    styled_df = styled_df \
+                        .background_gradient(cmap='OrRd_r', subset=['% Từ Đỉnh 52T']) \
+                        .background_gradient(cmap='Blues', subset=['% Hồi Từ Đáy 52T'])
+                styled_df = styled_df.format({
+                    'Giá Hiện Tại': '{:.2f}', 'MA20': '{:.2f}', 'MA50': '{:.2f}', 'MA150': '{:.2f}', 'MA200': '{:.2f}',
+                    '% Từ Đỉnh 52T': '{:+.1f}%', '% Hồi Từ Đáy 52T': '+{:.1f}%',
+                    'RS Rating': '{:.0f}', 'KLGD TB 20P': '{:,.0f}'
+                }, na_rep="-")
                 st.dataframe(styled_df, use_container_width=True, height=450, hide_index=True)
             else:
                 st.warning(
@@ -774,12 +893,10 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     with tabs[1]:
         st.markdown("### 📐 Tín hiệu Điểm Mua Mô hình Thu hẹp Biến động (VCP)")
         st.caption(
-            "Các cổ phiếu thỏa mãn Trend Template được quét cấu trúc VCP (Lookback 150 ngày, nền giá >= 15 ngày).")
+            f"Quét các cổ phiếu thỏa mãn Trend Template (RS >= 60, KLGD TB 20P >= {min_vol_filter:,.0f} CP) hình thành cấu trúc VCP (Lookback 150 ngày, nền giá >= 15 ngày, chưa gãy đáy thu hẹp cuối).")
 
         if vcp_list:
-            vcp_df = pd.DataFrame(vcp_list)
-            vcp_df = vcp_df.sort_values(by=['_priority', '_abs_dist', 'RS Rating'], ascending=[True, True, False]).drop(
-                columns=['_priority', '_abs_dist'])
+            vcp_df = pd.DataFrame(vcp_list).drop(columns=['_priority', '_abs_dist'])
             st.success(f"🎯 Phát hiện **{len(vcp_df)}** mã có cấu trúc giá tích lũy VCP hợp lệ.")
 
             def style_vcp_status(val):
@@ -805,7 +922,8 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
     with tabs[2]:
         st.markdown("### 🔍 Chẩn Đoán Cổ Phiếu Đơn & Đồ Thị Kỹ Thuật")
 
-        all_tickers = [t for t in symbols if t in set(latest_data['Ticker'].unique())]
+        available_tickers = set(latest_data['Ticker'].unique())
+        all_tickers = [t for t in symbols if t in available_tickers]
         minervini_set = set(base_stocks['Ticker'].tolist()) if not base_stocks.empty else set()
         rs_map = dict(zip(latest_data['Ticker'], latest_data['RS_Rating']))
 
@@ -816,14 +934,15 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
         ordered_tickers = vcp_sorted + minervini_only + other_tickers
 
         def format_ticker_label(t):
-            rs_val = rs_map.get(t, 0)
+            rs_val = rs_map.get(t)
+            rs_str = f"{int(rs_val)}" if pd.notna(rs_val) else "N/A"
             cname = symbol_names.get(t, "")
             name_part = f" — {cname}" if cname else ""
             if t in vcp_tickers_set:
-                return f"📐 {t}{name_part} [VCP | RS: {rs_val}]"
+                return f"📐 {t}{name_part} [VCP | RS: {rs_str}]"
             elif t in minervini_set:
-                return f"🔥 {t}{name_part} [Minervini | RS: {rs_val}]"
-            return f"{t}{name_part} (RS: {rs_val})"
+                return f"🔥 {t}{name_part} [Minervini | RS: {rs_str}]"
+            return f"{t}{name_part} (RS: {rs_str})"
 
         if 'selected_diag_ticker' not in st.session_state or st.session_state['selected_diag_ticker'] not in ordered_tickers:
             st.session_state['selected_diag_ticker'] = ordered_tickers[0] if ordered_tickers else None
@@ -850,112 +969,126 @@ def render_dashboard_body(df_raw, df_vnindex, daily_base, df_hist_base, symbols,
                 tk = tk_data.iloc[0]
                 phase_title, phase_color, phase_desc = evaluate_stock_phase(tk)
                 comp_name = symbol_names.get(selected_ticker, "")
+                tk_date_str = tk['Date'].strftime('%d/%m/%Y') if pd.notna(tk['Date']) else ""
 
-                if comp_name:
-                    st.markdown(f"#### 🏢 {selected_ticker} — {comp_name}")
+                header_name = f"🏢 {selected_ticker} — {comp_name}" if comp_name else f"🏢 {selected_ticker}"
+                st.markdown(f"#### {header_name} <span style='font-size:0.8rem; color:#64748b; font-weight:500;'>(Phiên {tk_date_str})</span>", unsafe_allow_html=True)
 
-                stock_history = df_history[df_history['Ticker'] == selected_ticker]
+                stock_history = df_history[df_history['Ticker'] == selected_ticker].sort_values('Date')
                 vcp_diag = detect_vcp_pattern(stock_history, actual_eval_date, lookback_days=150)
 
                 st.markdown(f"""
-                <div style='border: 1px solid {phase_color}; border-left: 8px solid {phase_color}; padding: 14px 18px; border-radius: 8px; background-color: #ffffff; margin-bottom: 14px;'>
-                    <div style='color: {phase_color}; font-weight: 800; font-size: 1.1rem; margin-bottom: 3px;'>🧭 {phase_title}</div>
-                    <div style='color: #475569; font-size: 0.88rem;'>{phase_desc}</div>
+                <div style='border: 1px solid {phase_color}; border-left: 8px solid {phase_color}; padding: 14px 18px; border-radius: 10px; background-color: #ffffff; margin-bottom: 12px;'>
+                    <div style='color: {phase_color}; font-weight: 800; font-size: 1.05rem; margin-bottom: 3px;'>🧭 {phase_title}</div>
+                    <div style='color: #475569; font-size: 0.87rem;'>{phase_desc}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
                 if vcp_diag:
                     st.markdown(f"""
-                    <div style='border: 1px solid #8b5cf6; border-left: 8px solid #8b5cf6; padding: 12px 16px; border-radius: 8px; background-color: #f5f3ff; margin-bottom: 16px;'>
+                    <div style='border: 1px solid #8b5cf6; border-left: 8px solid #8b5cf6; padding: 12px 16px; border-radius: 10px; background-color: #f5f3ff; margin-bottom: 14px;'>
                         <span style='color: #6d28d9; font-weight: 800;'>📐 MÔ HÌNH VCP HỢP LỆ ({vcp_diag['base_days']} ngày):</span>
                         Số vòng thu hẹp: <b>{vcp_diag['num_contractions']}T ({' -> '.join([str(r) + '%' for r in vcp_diag['ranges']])})</b> |
                         Điểm Pivot: <b>{vcp_diag['buy_point']:.2f}</b> | Cách Pivot: <b>{vcp_diag['pct_from_pivot']:+.1f}%</b> ({vcp_diag['status']})
                     </div>
                     """, unsafe_allow_html=True)
 
+                ma20_ok = pd.notna(tk['MA20']) and tk['Close'] >= tk['MA20']
+                ma50_ok = pd.notna(tk['MA50']) and tk['Close'] > tk['MA50']
+                ma_long_ok = pd.notna(tk['MA150']) and pd.notna(tk['MA200']) and tk['Close'] > tk['MA150'] and tk['Close'] > tk['MA200']
+                ma200_up = pd.notna(tk['MA200']) and pd.notna(tk['MA200_20D_ago']) and tk['MA200'] > tk['MA200_20D_ago']
+                rs_display = f"{int(tk['RS_Rating'])}" if pd.notna(tk['RS_Rating']) else "N/A"
+
                 colA, colB, colC = st.columns(3)
                 with colA:
-                    st.markdown("**Cấu trúc Xu hướng & MA:**")
-                    ma20_ok = pd.notna(tk['MA20']) and tk['Close'] >= tk['MA20']
-                    ma50_ok = pd.notna(tk['MA50']) and tk['Close'] > tk['MA50']
-                    ma_long_ok = pd.notna(tk['MA150']) and pd.notna(tk['MA200']) and tk['Close'] > tk['MA150'] and tk['Close'] > tk['MA200']
-                    st.write(f"- Giá ({fmt_num(tk['Close'])}) vs MA20 ({fmt_num(tk['MA20'])}): {'✅ Nằm trên' if ma20_ok else '❌ Gãy MA20'}")
-                    st.write(f"- Giá vs MA50 ({fmt_num(tk['MA50'])}): {'✅ Nằm trên' if ma50_ok else '❌ Nằm dưới'}")
-                    st.write(f"- Giá vs MA150 & MA200: {'✅ Nằm trên' if ma_long_ok else '❌ Nằm dưới'}")
+                    st.markdown(f"""
+                    <div class="diag-card">
+                        <div class="diag-card-title">📊 Cấu trúc Xu hướng & MA</div>
+                        <div class="diag-row">• Giá (<b>{fmt_num(tk['Close'])}</b>) vs MA20 ({fmt_num(tk['MA20'])}): {'✅ Nằm trên' if ma20_ok else '❌ Gãy MA20'}</div>
+                        <div class="diag-row">• Giá vs MA50 ({fmt_num(tk['MA50'])}): {'✅ Nằm trên' if ma50_ok else '❌ Nằm dưới'}</div>
+                        <div class="diag-row">• Giá vs MA150 / MA200 ({fmt_num(tk['MA150'])} / {fmt_num(tk['MA200'])}): {'✅ Nằm trên' if ma_long_ok else '❌ Nằm dưới'}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 with colB:
-                    st.markdown("**Vị thế Đỉnh / Đáy 52 Tuần:**")
-                    st.write(f"- Đỉnh 52T: **{fmt_num(tk['Peak_52W'])}** (Cách: **{fmt_num(tk['Pct_From_Peak'], '{:.1f}%')}**)")
-                    st.write(f"- Đáy 52T: **{fmt_num(tk['Bottom_52W'])}** (Cách: **+{fmt_num(tk['Pct_From_Bottom'], '{:.1f}%')}**)")
-                    ma200_up = pd.notna(tk['MA200']) and pd.notna(tk['MA200_20D_ago']) and tk['MA200'] > tk['MA200_20D_ago']
-                    st.write(f"- Độ dốc MA200: {'✅ Dốc lên' if ma200_up else '❌ Đi ngang / Dốc xuống'}")
+                    st.markdown(f"""
+                    <div class="diag-card">
+                        <div class="diag-card-title">🎯 Vị thế Đỉnh / Đáy 52 Tuần</div>
+                        <div class="diag-row">• Đỉnh 52T: <b>{fmt_num(tk['Peak_52W'])}</b> (Cách: <b>{fmt_num(tk['Pct_From_Peak'], '{:+.1f}%')}</b>)</div>
+                        <div class="diag-row">• Đáy 52T: <b>{fmt_num(tk['Bottom_52W'])}</b> (Cách: <b>+{fmt_num(tk['Pct_From_Bottom'], '{:.1f}%')}</b>)</div>
+                        <div class="diag-row">• Độ dốc MA200: {'✅ Dốc lên' if ma200_up else '❌ Đi ngang / Dốc xuống'}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 with colC:
-                    st.markdown("**Sức mạnh & Thanh khoản:**")
-                    st.markdown(
-                        f"Điểm RS Rating: <span style='font-size:1.4rem; font-weight:800; color:#8b5cf6;'>{tk['RS_Rating']}</span> / 99",
-                        unsafe_allow_html=True)
-                    st.write(f"- KLGD phiên: **{fmt_num(tk['Volume'], '{:,.0f}')}** CP")
-                    st.write(f"- KLGD TB 20P: **{fmt_num(tk['Vol_MA20'], '{:,.0f}')}** CP")
+                    st.markdown(f"""
+                    <div class="diag-card">
+                        <div class="diag-card-title">⚡ Sức mạnh & Thanh khoản</div>
+                        <div class="diag-row">• Điểm RS Rating: <span style='font-size:1.3rem; font-weight:800; color:#8b5cf6;'>{rs_display}</span> / 99</div>
+                        <div class="diag-row">• KLGD phiên: <b>{fmt_num(tk['Volume'], '{:,.0f}')}</b> CP</div>
+                        <div class="diag-row">• KLGD TB 20P: <b>{fmt_num(tk['Vol_MA20'], '{:,.0f}')}</b> CP</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
                 stock_plot = stock_history[stock_history['Date'] <= actual_eval_date].tail(160)
 
                 if not stock_plot.empty:
-                    fig_stock = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                                              row_heights=[0.74, 0.26])
+                    with st.container(border=True):
+                        fig_stock = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                                                  row_heights=[0.74, 0.26])
 
-                    if "Nến" in chart_type:
-                        fig_stock.add_trace(go.Candlestick(
-                            x=stock_plot['Date'], open=stock_plot['Open'], high=stock_plot['High'],
-                            low=stock_plot['Low'], close=stock_plot['Close'], name="Giá (OHLC)",
-                            increasing_line_color='#10b981', decreasing_line_color='#ef4444'
-                        ), row=1, col=1)
-                    else:
-                        fig_stock.add_trace(go.Scatter(
-                            x=stock_plot['Date'], y=stock_plot['Close'], name="Giá đóng cửa",
-                            line=dict(color='#0284c7', width=2.5)
-                        ), row=1, col=1)
+                        if "Nến" in chart_type:
+                            fig_stock.add_trace(go.Candlestick(
+                                x=stock_plot['Date'], open=stock_plot['Open'], high=stock_plot['High'],
+                                low=stock_plot['Low'], close=stock_plot['Close'], name="Giá (OHLC)",
+                                increasing_line_color='#10b981', decreasing_line_color='#ef4444'
+                            ), row=1, col=1)
+                        else:
+                            fig_stock.add_trace(go.Scatter(
+                                x=stock_plot['Date'], y=stock_plot['Close'], name="Giá đóng cửa",
+                                line=dict(color='#0284c7', width=2.5)
+                            ), row=1, col=1)
 
-                    fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA20'], name="MA20",
-                                                   line=dict(color='#10b981', width=1.3, dash='dot')), row=1, col=1)
-                    fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA50'], name="MA50",
-                                                   line=dict(color='#f97316', width=1.5, dash='dash')), row=1, col=1)
-                    fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA150'], name="MA150",
-                                                   line=dict(color='#8b5cf6', width=1.5, dash='dash')), row=1, col=1)
-                    fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA200'], name="MA200",
-                                                   line=dict(color='#ef4444', width=2)), row=1, col=1)
+                        fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA20'], name="MA20",
+                                                       line=dict(color='#10b981', width=1.3, dash='dot')), row=1, col=1)
+                        fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA50'], name="MA50",
+                                                       line=dict(color='#f97316', width=1.5, dash='dash')), row=1, col=1)
+                        fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA150'], name="MA150",
+                                                       line=dict(color='#8b5cf6', width=1.5, dash='dash')), row=1, col=1)
+                        fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['MA200'], name="MA200",
+                                                       line=dict(color='#ef4444', width=2)), row=1, col=1)
 
-                    if vcp_diag:
-                        fig_stock.add_trace(go.Scatter(
-                            x=vcp_diag['zigzag_dates'], y=vcp_diag['zigzag_vals'],
-                            mode='lines+markers', name=f"Sóng VCP ({vcp_diag['num_contractions']}T)",
-                            line=dict(color='#6d28d9', width=2, dash='dot'), marker=dict(size=7, color='#6d28d9')
-                        ), row=1, col=1)
-                        fig_stock.add_hline(
-                            y=vcp_diag['buy_point'], line_dash="dot", line_color="#8b5cf6", line_width=2,
-                            annotation_text=f"Pivot: {vcp_diag['buy_point']:.2f}", annotation_position="top right",
-                            row=1, col=1
+                        if vcp_diag:
+                            fig_stock.add_trace(go.Scatter(
+                                x=vcp_diag['zigzag_dates'], y=vcp_diag['zigzag_vals'],
+                                mode='lines+markers', name=f"Sóng VCP ({vcp_diag['num_contractions']}T)",
+                                line=dict(color='#6d28d9', width=2, dash='dot'), marker=dict(size=7, color='#6d28d9')
+                            ), row=1, col=1)
+                            fig_stock.add_hline(
+                                y=vcp_diag['buy_point'], line_dash="dot", line_color="#8b5cf6", line_width=2,
+                                annotation_text=f"Pivot: {vcp_diag['buy_point']:.2f}", annotation_position="top right",
+                                row=1, col=1
+                            )
+
+                        vol_colors = np.where(stock_plot['Close'] >= stock_plot['Open'], '#10b981', '#ef4444')
+                        fig_stock.add_trace(
+                            go.Bar(x=stock_plot['Date'], y=stock_plot['Volume'], name="Khối lượng", marker_color=vol_colors,
+                                   opacity=0.75), row=2, col=1)
+                        fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['Vol_MA50'], name="MA50 Volume",
+                                                       line=dict(color='#0284c7', width=1.5)), row=2, col=1)
+
+                        fig_stock.update_layout(
+                            uirevision=selected_ticker,
+                            hovermode="x unified", height=560, xaxis_rangeslider_visible=False,
+                            margin=dict(l=50, r=20, t=44, b=8), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                         )
-
-                    vol_colors = np.where(stock_plot['Close'] >= stock_plot['Open'], '#10b981', '#ef4444')
-                    fig_stock.add_trace(
-                        go.Bar(x=stock_plot['Date'], y=stock_plot['Volume'], name="Khối lượng", marker_color=vol_colors,
-                               opacity=0.75), row=2, col=1)
-                    fig_stock.add_trace(go.Scatter(x=stock_plot['Date'], y=stock_plot['Vol_MA50'], name="MA50 Volume",
-                                                   line=dict(color='#0284c7', width=1.5)), row=2, col=1)
-
-                    fig_stock.update_layout(
-                        uirevision=selected_ticker,
-                        hovermode="x unified", height=540, xaxis_rangeslider_visible=False,
-                        margin=dict(l=50, r=20, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    fig_stock.update_xaxes(showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
-                                           hoverformat="%d/%m/%Y", rangebreaks=[dict(bounds=["sat", "mon"])])
-                    fig_stock.update_yaxes(title_text="Giá", showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
-                                           row=1, col=1)
-                    fig_stock.update_yaxes(title_text="Volume", showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
-                                           row=2, col=1)
-                    st.plotly_chart(fig_stock, use_container_width=True)
+                        fig_stock.update_xaxes(showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
+                                               hoverformat="%d/%m/%Y", rangebreaks=[dict(bounds=["sat", "mon"])])
+                        fig_stock.update_yaxes(title_text="Giá", showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
+                                               row=1, col=1)
+                        fig_stock.update_yaxes(title_text="Volume", showgrid=True, gridcolor='#f1f5f9', linecolor='#e2e8f0',
+                                               row=2, col=1)
+                        st.plotly_chart(fig_stock, use_container_width=True, config={"displaylogo": False})
 
 
 @st.fragment(run_every="10s")
@@ -976,25 +1109,33 @@ def main():
 
     today = get_vn_today()
     default_start_date = today - datetime.timedelta(days=550)
+    validation_error = None
 
     with st.sidebar:
         st.markdown("### 📡 Danh Mục Gốc SSI")
         basket_choice = st.selectbox("Chọn bảng / rổ gốc SSI:", list(BASKETS.keys()), index=0)
-        custom_tickers = st.text_input("Hoặc gõ danh sách mã riêng:", placeholder="VD: FPT, SSI, HPG, VCB")
+        custom_tickers = st.text_input("Hoặc gõ danh sách mã riêng:", placeholder="VD: FPT, SSI, PC1, HPG")
 
         if custom_tickers.strip():
-            symbols = list(dict.fromkeys(
-                s.strip().upper() for s in custom_tickers.split(",") if len(s.strip()) == 3 and s.strip().isalpha()
-            ))
-            master_names = cached_ssi_master_names()
-            symbol_names = {s: master_names.get(s, "") for s in symbols}
-            source_info = "Danh sách tự nhập (map tên gốc SSI)"
+            raw_tokens = [s.strip().upper() for s in re.split(r'[\s,;]+', custom_tickers.strip()) if s.strip()]
+            symbols = list(dict.fromkeys(s for s in raw_tokens if is_valid_vn_ticker(s)))
+            if symbols:
+                master_names = cached_ssi_master_names()
+                symbol_names = {s: master_names.get(s, "") for s in symbols}
+                source_info = "Danh sách tự nhập (map tên gốc SSI)"
+            else:
+                symbol_names = {}
+                source_info = "Danh sách tự nhập không hợp lệ"
+                validation_error = "⚠️ Không tìm thấy mã cổ phiếu hợp lệ (mỗi mã gồm 3 ký tự, bắt đầu bằng chữ cái, VD: FPT, PC1, HPG)."
         elif BASKETS[basket_choice][0] == "ws":
             symbols, symbol_names, source_info = get_ssi_basket(basket_choice)
         else:
             symbols, symbol_names, source_info = cached_ssi_basket(basket_choice)
 
-        st.success(f"🎯 **{len(symbols)}** cổ phiếu\n\nNguồn: *{source_info}*")
+        if symbols:
+            st.success(f"🎯 **{len(symbols)}** cổ phiếu\n\nNguồn: *{source_info}*")
+        else:
+            st.error(validation_error or "⚠️ Danh mục cổ phiếu đang trống.")
 
         st.markdown("---")
         st.markdown("### 📅 Dải Ngày Phân Tích (Tối thiểu 400 ngày)")
@@ -1007,13 +1148,13 @@ def main():
 
         diff_days = (fetch_end - fetch_start).days
         if fetch_start >= fetch_end:
-            st.error("⚠️ Ngày bắt đầu phải nhỏ hơn ngày kết thúc!")
-            return
+            validation_error = "⚠️ Ngày bắt đầu phải nhỏ hơn ngày kết thúc!"
+            st.error(validation_error)
         elif diff_days < 400:
-            st.warning(f"⚠️ Dải ngày hiện tại ({diff_days} ngày) chưa đủ 400 ngày để tính MA200.")
-            return
+            validation_error = f"⚠️ Dải ngày hiện tại ({diff_days} ngày) chưa đủ 400 ngày để phân tích chu kỳ dài hạn & MA200."
+            st.warning(validation_error)
         else:
-            st.caption(f"✅ Biên độ hiển thị: **{diff_days}** ngày (+330 ngày đệm tính MA200)")
+            st.caption(f"✅ Biên độ hiển thị: **{diff_days}** ngày (+400 ngày đệm tính MA200 & 52T)")
 
         st.markdown("---")
         st.markdown("### ⚙️ Tùy Chỉnh Biểu Đồ & Thanh Khoản")
@@ -1023,8 +1164,8 @@ def main():
             min_value=0, max_value=5000000, value=50000, step=10000
         )
 
-        realtime_on = st.toggle("⚡ Bật Realtime Trong Phiên (Live Engine)", value=feed.is_running)
-        if realtime_on:
+        realtime_on = st.toggle("⚡ Bật Realtime Trong Phiên (Live Engine)", value=feed.is_running, key="realtime_toggle")
+        if realtime_on and symbols:
             feed.start(symbols, basket_label=basket_choice)
             pause_live = st.checkbox(
                 "⏸️ Tạm dừng nhảy số (để soi mã)",
@@ -1037,14 +1178,19 @@ def main():
             pause_live = False
 
         if st.button("🔄 Tải mới danh mục & dữ liệu", use_container_width=True):
+            reset_ssi_circuit_breaker()
             st.cache_data.clear()
             st.rerun()
+
+    if validation_error:
+        st.warning(validation_error)
+        return
 
     with st.spinner(f"⏳ Đang đồng bộ & tính toán chỉ báo ({len(symbols)} cổ phiếu từ SSI)..."):
         df_raw, df_vnindex, daily_base, df_hist_base = cached_market_base(tuple(symbols), fetch_start, fetch_end)
 
     if df_raw.empty:
-        st.error("⚠️ Không tải được dữ liệu từ API. Vui lòng kiểm tra lại kết nối mạng!")
+        st.error("⚠️ Không tải được dữ liệu từ API. Vui lòng kiểm tra lại kết nối mạng hoặc nhấn 'Tải mới danh mục & dữ liệu'!")
         return
 
     if realtime_on and not pause_live:
